@@ -1,6 +1,4 @@
-# ================= PART 1/3 =================
-# app.py — Part 1: imports, config, utils, data loading, RAG, image helpers
-
+# app.py — Full running Streamlit app with upgraded functions
 import streamlit as st
 import requests
 import pandas as pd
@@ -144,7 +142,7 @@ def retrieve_similar(query, top_k=8):
 def geocode(city):
     try:
         r = requests.get("https://api.geoapify.com/v1/geocode/search",
-                         params={"text": city, "apiKey": st.session_state["geo_key"], "limit": 1}, timeout=8)
+                         params={"text": city, "apiKey": st.session_state.get("geo_key", DEFAULT_GEOAPIFY), "limit": 1}, timeout=8)
         if r.ok and r.json().get("features"):
             return r.json()["features"][0]["properties"]
     except:
@@ -153,7 +151,7 @@ def geocode(city):
 def geo_places(lat, lon, category_key, limit=40):
     try:
         r = requests.get("https://api.geoapify.com/v2/places",
-                         params={"categories": category_key, "filter": f"circle:{lon},{lat},9000", "limit": limit, "apiKey": st.session_state["geo_key"]},
+                         params={"categories": category_key, "filter": f"circle:{lon},{lat},9000", "limit": limit, "apiKey": st.session_state.get("geo_key", DEFAULT_GEOAPIFY)},
                          timeout=10)
         if r.ok:
             return r.json().get("features", [])
@@ -267,9 +265,6 @@ def build_gallery(name, city, props=None, allow_google=False, limit=MAX_GALLERY)
 # helper to fetch extra images (used for place gallery)
 def fetch_more_images(name, city, allow_google=False, needed=MAX_PLACE_GALLERY):
     return build_gallery(name, city, None, allow_google=allow_google, limit=needed)
-# ================= PART 2/3 =================
-# app.py — Part 2: main UI, search, listing, more-details block (place gallery under info), hotels text-only
-# includes place map link, place weather under info, itinerary generator under weather, and multi-city comparison under itinerary
 
 # ---------------- LLM helpers & JSON extractor ----------------
 def ollama_call(system, user):
@@ -333,17 +328,122 @@ def get_place_rating(place):
     except:
         return None
 
+# ---------------- WEATHER FUNCTION (used later) ----------------
+def fetch_weather(lat, lon):
+    try:
+        u = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&current_weather=true&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_mean&timezone=auto&forecast_days=3"
+        r = requests.get(u, timeout=10)
+        if r.ok:
+            return r.json()
+    except:
+        return None
+
+# ---------------- Itinerary generator (LLM with fallback) ----------------
+def generate_itinerary(city_or_place, places, days=1):
+    """
+    Option A (simple text): returns simple text itinerary.
+    Will attempt Ollama LLM if enabled; otherwise fallback to simple split.
+    """
+    # If no places, return generic suggestions
+    if not places:
+        return "\n".join([f"Day {d+1}: Explore {city_or_place}." for d in range(days)])
+
+    # Try LLM (Ollama) first if enabled
+    if st.session_state.get("ollama_enabled", False):
+        system = "You are a travel planner. Return only JSON with key 'days' mapping to list of {day:int, schedule:[str,...]}."
+        user = f"City/Place: {city_or_place}\nPlaces:\n" + "\n".join(places[:30]) + f"\nDays: {days}\nReturn JSON only."
+        resp = ollama_call(system, user)
+        if resp:
+            try:
+                for c in resp.get("choices", []):
+                    txt = (c.get("message", {}) or {}).get("content") or c.get("content")
+                    parsed = extract_json_from_text(txt)
+                    if parsed and "days" in parsed:
+                        # convert to simple text format (Option A)
+                        lines = []
+                        for d in parsed["days"]:
+                            daynum = d.get("day") or d.get("day_num") or (len(lines)+1)
+                            schedule = d.get("schedule") or d.get("places") or []
+                            if isinstance(schedule, list):
+                                lines.append(f"Day {daynum}: " + " | ".join([str(x) for x in schedule]))
+                            else:
+                                lines.append(f"Day {daynum}: {schedule}")
+                        return "\n".join(lines)
+            except:
+                pass
+
+    # Fallback simple planner: split places across days (Option A minimal)
+    per = max(1, math.ceil(len(places) / days))
+    idx = 0
+    lines = []
+    for d in range(days):
+        picks = []
+        for _ in range(per):
+            if idx >= len(places): break
+            picks.append(places[idx])
+            idx += 1
+        lines.append(f"Day {d+1}: " + ", ".join(picks) if picks else f"Day {d+1}: Free / explore {city_or_place}")
+    return "\n".join(lines)
+
+# ---------------- Multi-city comparison (weather + places + rating) ----------------
+def compare_cities(cities, category="Tourist Attractions"):
+    """
+    Returns a list of dicts with city, count, top (list of names), avg_rating, and weather summary.
+    """
+    cat_map = {"Tourist Attractions":"tourism.sights,tourism.attraction", "Temples":"religion.place_of_worship", "Restaurants":"catering.restaurant", "Hotels":"accommodation.hotel"}
+    out = []
+    for city in cities:
+        city = city.strip()
+        if not city:
+            continue
+        props = geocode(city)
+        if not props:
+            out.append({"city": city, "error": "City not found"})
+            continue
+        lat = props.get("lat"); lon = props.get("lon")
+        feats = geo_places(lat, lon, cat_map.get(category, "tourism.sights"), limit=30)
+        count = len(feats)
+        top_names = []
+        ratings = []
+        for f in feats[:8]:
+            p = f.get("properties", {}) if isinstance(f, dict) else f
+            n = p.get("name") or p.get("formatted")
+            if n: top_names.append(n)
+            # rating fields might be under different keys
+            r = p.get("rating") or p.get("properties", {}).get("rating") if isinstance(p.get("properties", {}), dict) else None
+            if r is None:
+                r = p.get("importance") or p.get("popularity")
+            if r:
+                try: ratings.append(float(r))
+                except: pass
+        avg_rating = round(sum(ratings)/len(ratings), 2) if ratings else None
+        weather = None
+        try:
+            w = fetch_weather(lat, lon)
+            if w and w.get("current_weather"):
+                cw = w["current_weather"]
+                weather = f"{cw.get('temperature')}°C wind {cw.get('windspeed')} km/h"
+        except:
+            weather = None
+        out.append({"city": city, "count": count, "top": top_names, "avg_rating": avg_rating, "weather": weather})
+    return out
+
 # ---------------- Streamlit UI ----------------
 st.set_page_config(layout="wide", page_title="City Explorer Pro")
-st.title("🏙️ City Explorer Pro — Final")
+st.title("🏙️ City Explorer Pro — Final (Upgraded functions)")
 
 # Sidebar
 with st.sidebar:
     st.header("Settings")
+    # store geo_key in session_state
+    if "geo_key" not in st.session_state:
+        st.session_state["geo_key"] = DEFAULT_GEOAPIFY
     st.session_state["geo_key"] = st.text_input("Geoapify API Key", value=st.session_state.get("geo_key", DEFAULT_GEOAPIFY), type="password")
     st.session_state["ollama_enabled"] = st.checkbox("Enable Ollama (LLaMA-3)", value=st.session_state.get("ollama_enabled", False))
+    if "ollama_url" not in st.session_state:
+        st.session_state["ollama_url"] = DEFAULT_OLLAMA_URL
     st.session_state["ollama_url"] = st.text_input("Ollama URL", value=st.session_state.get("ollama_url", DEFAULT_OLLAMA_URL))
-    st.session_state["allow_google_images"] = st.checkbox("Enable Google Image Scraping (optional)", value=False)
+    st.session_state["allow_google_images"] = st.checkbox("Enable Google Image Scraping (optional)", value=st.session_state.get("allow_google_images", False))
     st.markdown("---")
     st.write(f"Indexed docs: {len(local_docs)}")
 
@@ -451,7 +551,7 @@ if "search_city" in st.session_state:
                         st.session_state["city_lon"] = city_lon
                         st.rerun()
 
-                # DETAILS PANEL (inline, Option A — Indented card)
+                # DETAILS PANEL (inline)
                 if st.session_state.get("selected_index") == i:
                     st.markdown("")  # spacer
                     with st.container():
@@ -540,6 +640,10 @@ if "search_city" in st.session_state:
                                 # meta may contain lat/lon for API items
                                 plat = meta.get("lat") or meta.get("latitude") or meta.get("LAT") or None
                                 plon = meta.get("lon") or meta.get("longitude") or meta.get("LON") or None
+                                # some Geoapify responses use 'lat' & 'lon' under 'properties'
+                                if not plat and isinstance(meta, dict):
+                                    plat = meta.get("lat") or meta.get("latitude")
+                                    plon = meta.get("lon") or meta.get("longitude")
                             except:
                                 pass
                             try:
@@ -573,17 +677,15 @@ if "search_city" in st.session_state:
                             else:
                                 st.info("Place-level weather not available (no coordinates).")
 
-                            # ITINERARY GENERATOR (inside details, under weather)
+                            # ITINERARY GENERATOR (inside details, under weather) — Option A (simple text)
                             st.markdown("### 🗓️ Itinerary generator (for this place / city)")
                             days_local = st.number_input(f"Days to plan for {pname}", min_value=1, max_value=7, value=1, key=f"days_{i}")
                             if st.button(f"Generate itinerary for {pname}", key=f"itin_{i}"):
                                 # choose top places for city as input
-                                top_places = [clean_string(x["name"]) for x in scored[:12]] if 'scored' in locals() else [pname]
-                                with st.spinner("Generating itinerary..."):
-                                    from_part = top_places
-                                    # call LLM-based or fallback itinerary
-                                    itin = generate_itinerary(pname if len(top_places)==1 else city, from_part, days=days_local)
-                                    st.json(itin)
+                                top_places = [clean_string(x["name"]) for x in scored[:12]] if 'scored' in locals() and scored else [pname]
+                                # call LLM-based or fallback itinerary
+                                itin = generate_itinerary(pname if len(top_places)==1 else city, top_places, days=int(days_local))
+                                st.text(itin)
 
                             # MULTI-CITY COMPARISON (right under itinerary)
                             st.markdown("### 🔁 Multi-city comparison")
@@ -592,7 +694,20 @@ if "search_city" in st.session_state:
                                 clist = [c.strip() for c in compare_input.split(",")][:4]
                                 with st.spinner("Comparing..."):
                                     comp = compare_cities(clist, category=category)
-                                    st.table(pd.DataFrame(comp))
+                                    # show as table-friendly DataFrame
+                                    df_out = []
+                                    for c in comp:
+                                        if c.get("error"):
+                                            df_out.append({"city": c["city"], "error": c["error"]})
+                                        else:
+                                            df_out.append({
+                                                "city": c["city"],
+                                                "place_count": c.get("count"),
+                                                "top_places": ", ".join(c.get("top", [])[:3]),
+                                                "avg_rating": c.get("avg_rating"),
+                                                "weather": c.get("weather")
+                                            })
+                                    st.table(pd.DataFrame(df_out))
 
                             st.markdown("---")
 
@@ -603,7 +718,7 @@ if "search_city" in st.session_state:
                                 st.write("No nearby hotels found.")
                             else:
                                 for hh in hotels_hits[:7]:
-                                    hp = hh.get("properties", {})
+                                    hp = hh.get("properties", {}) if isinstance(hh, dict) else hh
                                     hname = hp.get("name") or hp.get("formatted") or "Unnamed Hotel"
                                     addr = hp.get("address_line1") or hp.get("address_line2") or hp.get("formatted") or "Address not available"
                                     rating = hp.get("rating") or "Not rated"
@@ -634,90 +749,5 @@ if "search_city" in st.session_state:
                 st.rerun()
         else:
             st.info("End of results.")
-# ================= PART 3/3 =================
-# app.py — Part 3: Weather helper, itinerary + compare functions, (NO Notes & Tips footer)
 
-# ---------------- WEATHER FUNCTION (used earlier) ----------------
-def fetch_weather(lat, lon):
-    try:
-        u = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&current_weather=true&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_mean&timezone=auto&forecast_days=3"
-        r = requests.get(u, timeout=10)
-        if r.ok:
-            return r.json()
-    except:
-        return None
-
-# ---------------- Itinerary generator (LLM with fallback) ----------------
-def generate_itinerary(city_or_place, places, days=1):
-    """
-    Try Ollama LLM to create an itinerary JSON.
-    Fallback to a simple greedy split if LLM not available or fails.
-    """
-    # If no places, return empty structure
-    if not places:
-        return {"days": [{"day": d+1, "schedule": []} for d in range(days)]}
-
-    # LLM attempt
-    if st.session_state.get("ollama_enabled", False):
-        system = "You are a helpful travel planner. Return ONLY valid JSON with key 'days' containing list of days and schedules."
-        user = f"City/Place: {city_or_place}\nPlaces:\n" + "\n".join(places[:30]) + f"\nDays: {days}\nReturn JSON only."
-        resp = ollama_call(system, user)
-        if resp:
-            try:
-                for c in resp.get("choices", []):
-                    msg = c.get("message") or {}
-                    text = msg.get("content") or c.get("content")
-                    j = extract_json_from_text(text)
-                    if j:
-                        return j
-            except:
-                pass
-
-    # Fallback simple planner: split places across days
-    per = max(1, math.ceil(len(places) / days))
-    itinerary = {"days": []}
-    idx = 0
-    for d in range(days):
-        schedule = []
-        hour = 9
-        for _ in range(per):
-            if idx >= len(places): break
-            schedule.append({"time": f"{hour:02d}:00", "place": places[idx], "note": "Suggested visit 1-2 hours"})
-            hour += 2
-            idx += 1
-        itinerary["days"].append({"day": d+1, "schedule": schedule})
-    return itinerary
-
-# ---------------- Multi-city comparison (used earlier) ----------------
-def compare_cities(cities, category="Tourist Attractions"):
-    cat_map = {"Tourist Attractions":"tourism.sights,tourism.attraction", "Temples":"religion.place_of_worship", "Restaurants":"catering.restaurant", "Hotels":"accommodation.hotel"}
-    out = []
-    for city in cities:
-        city = city.strip()
-        if not city:
-            continue
-        props = geocode(city)
-        if not props:
-            out.append({"city": city, "error": "City not found"})
-            continue
-        lat = props.get("lat"); lon = props.get("lon")
-        feats = geo_places(lat, lon, cat_map.get(category, "tourism.sights"), limit=30)
-        count = len(feats)
-        top_names = []
-        ratings = []
-        for f in feats[:8]:
-            p = f.get("properties", {})
-            n = p.get("name") or p.get("formatted")
-            if n: top_names.append(n)
-            r = p.get("rating") or p.get("properties", {}).get("rating")
-            if r:
-                try: ratings.append(float(r))
-                except: pass
-        avg_rating = round(sum(ratings)/len(ratings), 2) if ratings else None
-        out.append({"city": city, "count": count, "top": top_names, "avg_rating": avg_rating})
-    return out
-
-# ---------------- END: no Notes & Tips footer (removed as requested) ----------------
-
-# small confirmation caption
-st.caption("App ready — place map links, place-level weather, itinerary and multi-city comparison are available inside the More Details card.")
+st.caption("App ready — place map links, place-level weather, itinerary (text) and multi-city comparison (weather + places + rating) are available inside the More Details card.")

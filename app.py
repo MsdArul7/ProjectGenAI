@@ -1,26 +1,30 @@
-# app.py — Full running Streamlit app with upgraded functions
+# app.py — Streamlit app with ChromaDB Vector Search
 import streamlit as st
 import requests
 import pandas as pd
 import json
 import math
-import time
 import urllib.parse
 import re
+import os
 from pathlib import Path
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
 from bs4 import BeautifulSoup
+
+# --- NEW IMPORTS FOR CHROMA ---
+import chromadb
+from chromadb.utils import embedding_functions
 
 # ---------------- CONFIG ----------------
 DATA_DIR = Path("data")
+# Create a folder for the vector db if it doesn't exist
+CHROMA_DB_PATH = "chroma_db_store"
 DEFAULT_GEOAPIFY = "0ace8c8462a943b982df4fd2750d3407"
 DEFAULT_OLLAMA_URL = "http://localhost:11434/api/chat"
 
 INITIAL_SHOW = 15
 PAGE_STEP = 10
 MAX_GALLERY = 8
-MAX_PLACE_GALLERY = 3  # show 3 images under info box
+MAX_PLACE_GALLERY = 3
 MAX_HOTEL_GALLERY = 5
 
 # ---------------- UTIL ----------------
@@ -43,25 +47,25 @@ def load_all():
     out = {}
     try:
         out["places_df"] = pd.read_csv(DATA_DIR / "Places.csv")
-    except:
+    except Exception:
         out["places_df"] = pd.DataFrame()
     try:
         out["city_df"] = pd.read_csv(DATA_DIR / "City.csv")
-    except:
+    except Exception:
         out["city_df"] = pd.DataFrame()
     try:
         out["tourism_json"] = json.load(open(DATA_DIR / "india_tourism_big.json", "r", encoding="utf8"))
-    except:
+    except Exception:
         out["tourism_json"] = []
     try:
         out["faqs_json"] = json.load(open(DATA_DIR / "faqs_big.json", "r", encoding="utf8"))
-    except:
+    except Exception:
         out["faqs_json"] = []
     return out
 
 DATA = load_all()
 
-# ---------------- RAG: build local_docs ----------------
+# ---------------- PREPARE DOCS FOR DB ----------------
 local_docs = []
 
 if not DATA["places_df"].empty:
@@ -116,26 +120,106 @@ if not DATA["city_df"].empty:
             "meta": row.to_dict()
         })
 
-# ---------------- VECTORIZE ----------------
+# ---------------- CHROMA DB SETUP ----------------
 @st.cache_resource
-def build_vectorizer(docs):
-    texts = [d["text"] for d in docs] if docs else [""]
-    vect = TfidfVectorizer(stop_words="english", max_features=4000)
-    X = vect.fit_transform(texts)
-    return vect, X
+def setup_chromadb(docs):
+    """
+    Initializes ChromaDB, creates a collection, and ingests documents if empty.
+    Using 'all-MiniLM-L6-v2' for efficient local embeddings.
+    """
+    # 1. Initialize Client (Persistent)
+    client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
+    
+    # 2. Define Embedding Function
+    ef = embedding_functions.SentenceTransformerEmbeddingFunction(model_name="all-MiniLM-L6-v2")
+    
+    # 3. Get or Create Collection
+    collection = client.get_or_create_collection(name="city_explorer_docs", embedding_function=ef)
+    
+    # 4. Check if data exists; if not, ingest
+    if collection.count() == 0 and docs:
+        print("Ingesting documents into ChromaDB...")
+        ids = []
+        documents = []
+        metadatas = []
+        
+        for d in docs:
+            ids.append(d["id"])
+            documents.append(d["text"])
+            
+            # Chroma metadata must be flat and simple types (str, int, float, bool)
+            # We clean the 'meta' dict to ensure no nested lists/dicts exist
+            clean_meta = {}
+            original_meta = d.get("meta", {})
+            for k, v in original_meta.items():
+                if isinstance(v, (str, int, float, bool)):
+                    clean_meta[k] = v
+                else:
+                    clean_meta[k] = str(v) # Stringify complex objects
+            
+            # Add top-level fields to metadata for easier retrieval later
+            clean_meta["_type"] = d.get("type", "")
+            clean_meta["_city"] = d.get("city", "")
+            clean_meta["_title"] = d.get("title", "")
+            
+            metadatas.append(clean_meta)
+            
+        # Add in batches to be safe
+        batch_size = 100
+        for i in range(0, len(ids), batch_size):
+            collection.add(
+                ids=ids[i:i+batch_size],
+                documents=documents[i:i+batch_size],
+                metadatas=metadatas[i:i+batch_size]
+            )
+        print(f"Ingestion complete. {collection.count()} documents indexed.")
+        
+    return collection
 
-vectorizer, docs_X = build_vectorizer(local_docs)
+# Initialize Chroma
+collection = setup_chromadb(local_docs)
 
 def retrieve_similar(query, top_k=8):
-    if not local_docs:
+    """
+    Queries ChromaDB for semantic similarity.
+    """
+    if collection.count() == 0:
         return []
-    qv = vectorizer.transform([query])
-    sims = cosine_similarity(qv, docs_X).flatten()
-    idxs = sims.argsort()[::-1][:top_k]
+        
+    results = collection.query(
+        query_texts=[query],
+        n_results=top_k
+    )
+    
     out = []
-    for i in idxs:
-        if sims[i] <= 0: continue
-        out.append({"score": float(sims[i]), "doc": local_docs[i]})
+    # Chroma structure: results['ids'][0] is a list of ids
+    if results and results.get("ids"):
+        ids = results["ids"][0]
+        distances = results["distances"][0]
+        metas = results["metadatas"][0]
+        texts = results["documents"][0]
+        
+        for i in range(len(ids)):
+            # Convert metadata back to the structure the app expects
+            # We stored original meta fields flattened.
+            m = metas[i]
+            
+            # Reconstruct the 'doc' object
+            doc_obj = {
+                "id": ids[i],
+                "title": m.get("_title", ""),
+                "city": m.get("_city", ""),
+                "text": texts[i],
+                "type": m.get("_type", ""),
+                "meta": m 
+            }
+            
+            # Distance to Score (approximate). Chroma default is L2 distance.
+            # Lower distance = better match.
+            score = 1.0 / (1.0 + distances[i]) 
+            
+            out.append({"score": score, "doc": doc_obj})
+            
     return out
 
 # ---------------- GEOAPIFY helpers ----------------
@@ -171,7 +255,6 @@ def fetch_wikipedia_lead(name, city=None):
             if d.get("thumbnail"): return d["thumbnail"]["source"]
     except:
         pass
-    # try just name
     try:
         url = "https://en.wikipedia.org/api/rest_v1/page/summary/" + urllib.parse.quote(name)
         r = requests.get(url, timeout=6)
@@ -241,20 +324,16 @@ def google_images(query, limit=6):
 
 def build_gallery(name, city, props=None, allow_google=False, limit=MAX_GALLERY):
     gallery = []
-    # 1. Wikipedia lead
     w = fetch_wikipedia_lead(name, city)
     if w and w not in gallery:
         gallery.append(w)
-    # 2. Commons
     for u in fetch_commons_images(name, city, limit=limit):
         if u not in gallery:
             gallery.append(u)
             if len(gallery) >= limit: break
-    # 3. Geoapify
     g = geoapify_image(props or {})
     if g and g not in gallery and len(gallery) < limit:
         gallery.append(g)
-    # 4. Google images (optional)
     if allow_google and len(gallery) < limit:
         for u in google_images(f"{name} {city}", limit=limit - len(gallery)):
             if u not in gallery:
@@ -262,7 +341,6 @@ def build_gallery(name, city, props=None, allow_google=False, limit=MAX_GALLERY)
                 if len(gallery) >= limit: break
     return gallery[:limit]
 
-# helper to fetch extra images (used for place gallery)
 def fetch_more_images(name, city, allow_google=False, needed=MAX_PLACE_GALLERY):
     return build_gallery(name, city, None, allow_google=allow_google, limit=needed)
 
@@ -328,7 +406,7 @@ def get_place_rating(place):
     except:
         return None
 
-# ---------------- WEATHER FUNCTION (used later) ----------------
+# ---------------- WEATHER FUNCTION ----------------
 def fetch_weather(lat, lon):
     try:
         u = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&current_weather=true&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_mean&timezone=auto&forecast_days=3"
@@ -338,17 +416,11 @@ def fetch_weather(lat, lon):
     except:
         return None
 
-# ---------------- Itinerary generator (LLM with fallback) ----------------
+# ---------------- Itinerary generator ----------------
 def generate_itinerary(city_or_place, places, days=1):
-    """
-    Option A (simple text): returns simple text itinerary.
-    Will attempt Ollama LLM if enabled; otherwise fallback to simple split.
-    """
-    # If no places, return generic suggestions
     if not places:
         return "\n".join([f"Day {d+1}: Explore {city_or_place}." for d in range(days)])
 
-    # Try LLM (Ollama) first if enabled
     if st.session_state.get("ollama_enabled", False):
         system = "You are a travel planner. Return only JSON with key 'days' mapping to list of {day:int, schedule:[str,...]}."
         user = f"City/Place: {city_or_place}\nPlaces:\n" + "\n".join(places[:30]) + f"\nDays: {days}\nReturn JSON only."
@@ -359,7 +431,6 @@ def generate_itinerary(city_or_place, places, days=1):
                     txt = (c.get("message", {}) or {}).get("content") or c.get("content")
                     parsed = extract_json_from_text(txt)
                     if parsed and "days" in parsed:
-                        # convert to simple text format (Option A)
                         lines = []
                         for d in parsed["days"]:
                             daynum = d.get("day") or d.get("day_num") or (len(lines)+1)
@@ -372,7 +443,6 @@ def generate_itinerary(city_or_place, places, days=1):
             except:
                 pass
 
-    # Fallback simple planner: split places across days (Option A minimal)
     per = max(1, math.ceil(len(places) / days))
     idx = 0
     lines = []
@@ -385,11 +455,8 @@ def generate_itinerary(city_or_place, places, days=1):
         lines.append(f"Day {d+1}: " + ", ".join(picks) if picks else f"Day {d+1}: Free / explore {city_or_place}")
     return "\n".join(lines)
 
-# ---------------- Multi-city comparison (weather + places + rating) ----------------
+# ---------------- Multi-city comparison ----------------
 def compare_cities(cities, category="Tourist Attractions"):
-    """
-    Returns a list of dicts with city, count, top (list of names), avg_rating, and weather summary.
-    """
     cat_map = {"Tourist Attractions":"tourism.sights,tourism.attraction", "Temples":"religion.place_of_worship", "Restaurants":"catering.restaurant", "Hotels":"accommodation.hotel"}
     out = []
     for city in cities:
@@ -409,7 +476,6 @@ def compare_cities(cities, category="Tourist Attractions"):
             p = f.get("properties", {}) if isinstance(f, dict) else f
             n = p.get("name") or p.get("formatted")
             if n: top_names.append(n)
-            # rating fields might be under different keys
             r = p.get("rating") or p.get("properties", {}).get("rating") if isinstance(p.get("properties", {}), dict) else None
             if r is None:
                 r = p.get("importance") or p.get("popularity")
@@ -428,14 +494,35 @@ def compare_cities(cities, category="Tourist Attractions"):
         out.append({"city": city, "count": count, "top": top_names, "avg_rating": avg_rating, "weather": weather})
     return out
 
+# ---------------- CATEGORY MATCHING ----------------
+def matches_category(text, category):
+    if not text or not isinstance(text, str):
+        return False
+    t = text.lower()
+    keywords = {
+        "Tourist Attractions": ["museum", "monument", "attraction", "sight", "fort", "palace", "garden", "park", "beach", "zoo", "tower", "viewpoint", "archaeological", "heritage"],
+        "Temples": ["temple", "shrine", "mosque", "church", "gurudwara", "stupa", "mandir", "kovil"],
+        "Restaurants": ["restaurant", "cafe", "eatery", "diner", "bistro", "bar", "pub", "food", "canteen"],
+        "Hotels": ["hotel", "resort", "lodg", "guesthouse", "inn", "accommodation", "stay", "bnb", "hostel"]
+    }
+    kwlist = keywords.get(category, [])
+    for kw in kwlist:
+        if kw in t:
+            return True
+    if category == "Tourist Attractions":
+        place_like = ["tour", "visit", "attraction", "sight", "monument", "museum", "heritage", "park", "garden"]
+        for p in place_like:
+            if p in t:
+                return True
+    return False
+
 # ---------------- Streamlit UI ----------------
-st.set_page_config(layout="wide", page_title="City Explorer Pro")
-st.title("🏙️ City Explorer Pro — Final (Upgraded functions)")
+st.set_page_config(layout="wide", page_title="City Explorer Pro + ChromaDB")
+st.title("🏙️ City Explorer Pro (Powered by ChromaDB RAG)")
 
 # Sidebar
 with st.sidebar:
     st.header("Settings")
-    # store geo_key in session_state
     if "geo_key" not in st.session_state:
         st.session_state["geo_key"] = DEFAULT_GEOAPIFY
     st.session_state["geo_key"] = st.text_input("Geoapify API Key", value=st.session_state.get("geo_key", DEFAULT_GEOAPIFY), type="password")
@@ -443,9 +530,9 @@ with st.sidebar:
     if "ollama_url" not in st.session_state:
         st.session_state["ollama_url"] = DEFAULT_OLLAMA_URL
     st.session_state["ollama_url"] = st.text_input("Ollama URL", value=st.session_state.get("ollama_url", DEFAULT_OLLAMA_URL))
-    st.session_state["allow_google_images"] = st.checkbox("Enable Google Image Scraping (optional)", value=st.session_state.get("allow_google_images", False))
+    st.session_state["allow_google_images"] = st.checkbox("Enable Google Image Scraping", value=st.session_state.get("allow_google_images", False))
     st.markdown("---")
-    st.write(f"Indexed docs: {len(local_docs)}")
+    st.success(f"Chroma Docs: {collection.count()}")
 
 # Search row
 c1, c2, c3 = st.columns([3,2,1])
@@ -481,25 +568,7 @@ if "search_city" in st.session_state:
         # Merge local CSV/JSON + API
         candidates = []; seen = set()
 
-        if not DATA["places_df"].empty:
-            try:
-                df = DATA["places_df"]
-                city_rows = df[df["City"].str.contains(city, case=False, na=False)].fillna("")
-            except:
-                city_rows = pd.DataFrame()
-            for _, r in city_rows.iterrows():
-                nm = clean_string(r.get("Place", ""))
-                if nm and nm.lower() not in seen:
-                    candidates.append({"name": nm, "source": "csv", "meta": r.to_dict(), "text": r.get("Place_desc","")})
-                    seen.add(nm.lower())
-
-        for e in DATA["tourism_json"]:
-            nm = e.get("place","")
-            if nm and str(e.get("city","")).lower() == city.lower():
-                if nm.lower() not in seen:
-                    candidates.append({"name": nm, "source": "json", "meta": e, "text": e.get("description","")})
-                    seen.add(nm.lower())
-
+        # 1. API Results
         for f in api_feats:
             props = f.get("properties", {}) if isinstance(f, dict) else f
             nm = props.get("name") or props.get("formatted")
@@ -507,15 +576,54 @@ if "search_city" in st.session_state:
                 candidates.append({"name": nm, "source": "api", "meta": props, "text": props.get("formatted","")})
                 seen.add(nm.lower())
 
+        # 2. Local CSV (Filtered)
+        if not DATA["places_df"].empty:
+            try:
+                df = DATA["places_df"]
+                city_rows = df[df["City"].str.contains(city, case=False, na=False)].fillna("")
+            except Exception:
+                city_rows = pd.DataFrame()
+            for _, r in city_rows.iterrows():
+                nm = clean_string(r.get("Place", ""))
+                txt = " ".join([str(r.get("Place", "")), str(r.get("Place_desc", "")), str(r.get("Category", ""))]).strip()
+                if nm and nm.lower() not in seen:
+                    if matches_category(txt, category):
+                        candidates.append({"name": nm, "source": "csv", "meta": r.to_dict(), "text": r.get("Place_desc","")})
+                        seen.add(nm.lower())
+
+        # 3. Local JSON (Filtered)
+        for e in DATA["tourism_json"]:
+            nm = e.get("place","")
+            txt = " ".join([str(e.get("place","")), str(e.get("description","")), str(e.get("tags",""))])
+            if nm and str(e.get("city","")).lower() == city.lower():
+                if nm.lower() not in seen and matches_category(txt, category):
+                    candidates.append({"name": nm, "source": "json", "meta": e, "text": e.get("description","")})
+                    seen.add(nm.lower())
+
+        # Fallback
+        if len(candidates) < 6 and category == "Tourist Attractions" and not DATA["places_df"].empty:
+            try:
+                df = DATA["places_df"]
+                city_rows = df[df["City"].str.contains(city, case=False, na=False)].fillna("")
+                for _, r in city_rows.iterrows():
+                    nm = clean_string(r.get("Place", ""))
+                    if nm and nm.lower() not in seen:
+                        candidates.append({"name": nm, "source": "csv", "meta": r.to_dict(), "text": r.get("Place_desc","")})
+                        seen.add(nm.lower())
+                        if len(candidates) >= 12: break
+            except Exception: pass
+
+        # Scoring
         def score_item(it):
             s = 0
-            if it["source"] == "csv": s += 5
-            if it["source"] == "json": s += 4
+            if it["source"] == "api": s += 6
+            if it["source"] == "csv": s += 4
+            if it["source"] == "json": s += 3
             meta = it.get("meta") or {}
-            try: s += float(meta.get("rating") or 0)
+            try: s += float(meta.get("rating") or meta.get("Rating") or 0)
             except: pass
-            try: s += float(meta.get("popularity") or meta.get("importance") or 0) * 0.2
-            except: pass
+            name = (it.get("name") or "").lower()
+            if category == "Restaurants" and ("restaurant" in name or "cafe" in name): s += 2
             return s
 
         scored = sorted(candidates, key=lambda x: score_item(x), reverse=True)
@@ -534,7 +642,6 @@ if "search_city" in st.session_state:
         st.markdown("---")
         st.subheader(f"Top {len(shown)} (of {total}) — {category}")
 
-        # LIST DISPLAY
         for i, place in enumerate(shown):
             with st.container():
                 num = i+1
@@ -551,24 +658,24 @@ if "search_city" in st.session_state:
                         st.session_state["city_lon"] = city_lon
                         st.rerun()
 
-                # DETAILS PANEL (inline)
+                # DETAILS PANEL
                 if st.session_state.get("selected_index") == i:
-                    st.markdown("")  # spacer
+                    st.markdown("")
                     with st.container():
                         st.markdown("---")
                         left, right = st.columns([3,1])
 
-                        # LEFT: Text details + Info box + Place images (3-across)
                         with left:
                             pname = clean_string(place["name"])
                             meta = place.get("meta") or {}
-                            # gather context
+                            
+                            # RAG: RETRIEVE FROM CHROMA
                             sims = retrieve_similar(pname + " " + city, top_k=8)
                             ctx = [s["doc"]["text"] for s in sims]
                             wiki = fetch_wikipedia_lead(pname, city)
                             full_ctx = "\n".join([c for c in ctx if c]) + "\n" + (wiki or "")
 
-                            # AI (if enabled)
+                            # AI call
                             details = None
                             if st.session_state.get("ollama_enabled", False):
                                 system = "You are a travel expert. Return only JSON {description, timings, season, price, highlights}."
@@ -582,16 +689,13 @@ if "search_city" in st.session_state:
                                             if parsed:
                                                 details = parsed
                                                 break
-                                    except:
-                                        details = None
+                                    except: details = None
 
                             if not details:
                                 raw_desc = ""
                                 try:
-                                    if place["source"] == "csv":
-                                        raw_desc = meta.get("Place_desc", "")
-                                except:
-                                    raw_desc = ""
+                                    if place["source"] == "csv": raw_desc = meta.get("Place_desc", "")
+                                except: pass
                                 details = {
                                     "description": raw_desc or wiki or (place.get("text") or f"{pname} in {city}."),
                                     "timings": "Varies",
@@ -603,25 +707,21 @@ if "search_city" in st.session_state:
                             st.markdown(f"### 📖 About {pname}")
                             st.write(details.get("description", ""))
 
-                            # Info Box
                             city_best = get_city_best_time(city)
                             st.info(f"""
 **Visitor Information**
 - 🕒 **Timings:** {details.get('timings')}
-- 📅 **Best Season:** {details.get('season')}
 - 🎟️ **Entry Fee:** {details.get('price')}
 - 🌤️ **City Best Time:** {city_best}
 """)
 
-                            # 3-column place image gallery (exactly under the info box)
+                            # Gallery
                             allow_google = bool(st.session_state.get("allow_google_images", False))
                             place_imgs = fetch_more_images(pname, city, allow_google=allow_google, needed=MAX_PLACE_GALLERY)
-                            # ensure we have up to 3 images (try wiki lead first)
                             if len(place_imgs) < MAX_PLACE_GALLERY:
                                 lead = fetch_wikipedia_lead(pname, city)
                                 if lead and lead not in place_imgs:
                                     place_imgs.insert(0, lead)
-                            # limit to 3
                             place_imgs = place_imgs[:MAX_PLACE_GALLERY]
 
                             if place_imgs:
@@ -632,103 +732,53 @@ if "search_city" in st.session_state:
                                         with cols_imgs[idx_img]:
                                             st.image(img_url, use_container_width=True)
                             else:
-                                st.caption("No verified images found for this place.")
+                                st.caption("No verified images found.")
 
-                            # PLACE MAP LINK (place-specific)
+                            # Map & Weather
                             plat = None; plon = None
                             try:
-                                # meta may contain lat/lon for API items
-                                plat = meta.get("lat") or meta.get("latitude") or meta.get("LAT") or None
-                                plon = meta.get("lon") or meta.get("longitude") or meta.get("LON") or None
-                                # some Geoapify responses use 'lat' & 'lon' under 'properties'
-                                if not plat and isinstance(meta, dict):
-                                    plat = meta.get("lat") or meta.get("latitude")
-                                    plon = meta.get("lon") or meta.get("longitude")
-                            except:
-                                pass
-                            try:
-                                if plat and plon:
-                                    map_url = f"https://www.google.com/maps/dir/?api=1&destination={plat},{plon}"
-                                    st.markdown(f"[🗺️ Open place in Google Maps]({map_url})")
-                            except:
-                                pass
+                                plat = meta.get("lat") or meta.get("latitude")
+                                plon = meta.get("lon") or meta.get("longitude")
+                            except: pass
+                            
+                            if plat and plon:
+                                map_url = f"https://www.google.com/maps/dir/?api=1&destination={plat},{plon}"
+                                st.markdown(f"[🗺️ Open place in Google Maps]({map_url})")
+                                
+                                place_weather = fetch_weather(float(plat), float(plon))
+                                if place_weather:
+                                    st.markdown("### 🌤️ Weather at this place")
+                                    cw = place_weather.get("current_weather", {})
+                                    st.write(f"**Current:** {cw.get('temperature')}°C  |  wind {cw.get('windspeed')} km/h")
 
-                            # PLACE WEATHER (for the place coordinates if available)
-                            place_weather = None
-                            try:
-                                if plat and plon:
-                                    place_weather = fetch_weather(float(plat), float(plon))
-                            except:
-                                place_weather = None
-
-                            if place_weather:
-                                st.markdown("### 🌤️ Weather at this place")
-                                cw = place_weather.get("current_weather", {})
-                                st.write(f"**Current:** {cw.get('temperature')}°C  |  wind {cw.get('windspeed')} km/h")
-                                daily = place_weather.get("daily", {})
-                                if daily:
-                                    df = pd.DataFrame({
-                                        "date": daily.get("time", []),
-                                        "temp_max": daily.get("temperature_2m_max", []),
-                                        "temp_min": daily.get("temperature_2m_min", []),
-                                        "precip_prob": daily.get("precipitation_probability_mean", [])
-                                    })
-                                    st.table(df)
-                            else:
-                                st.info("Place-level weather not available (no coordinates).")
-
-                            # ITINERARY GENERATOR (inside details, under weather) — Option A (simple text)
-                            st.markdown("### 🗓️ Itinerary generator (for this place / city)")
+                            # Itinerary
+                            st.markdown("### 🗓️ Itinerary generator")
                             days_local = st.number_input(f"Days to plan for {pname}", min_value=1, max_value=7, value=1, key=f"days_{i}")
                             if st.button(f"Generate itinerary for {pname}", key=f"itin_{i}"):
-                                # choose top places for city as input
                                 top_places = [clean_string(x["name"]) for x in scored[:12]] if 'scored' in locals() and scored else [pname]
-                                # call LLM-based or fallback itinerary
                                 itin = generate_itinerary(pname if len(top_places)==1 else city, top_places, days=int(days_local))
                                 st.text(itin)
 
-                            # MULTI-CITY COMPARISON (right under itinerary)
+                            # Compare
                             st.markdown("### 🔁 Multi-city comparison")
-                            compare_input = st.text_input(f"Enter up to 4 cities to compare (comma separated) for {pname}", value=f"{city}, Mumbai, Delhi", key=f"cmp_{i}")
-                            if st.button(f"Compare cities (for {pname})", key=f"cmp_btn_{i}"):
+                            compare_input = st.text_input(f"Cities to compare for {pname}", value=f"{city}, Mumbai, Delhi", key=f"cmp_{i}")
+                            if st.button(f"Compare cities", key=f"cmp_btn_{i}"):
                                 clist = [c.strip() for c in compare_input.split(",")][:4]
-                                with st.spinner("Comparing..."):
-                                    comp = compare_cities(clist, category=category)
-                                    # show as table-friendly DataFrame
-                                    df_out = []
-                                    for c in comp:
-                                        if c.get("error"):
-                                            df_out.append({"city": c["city"], "error": c["error"]})
-                                        else:
-                                            df_out.append({
-                                                "city": c["city"],
-                                                "place_count": c.get("count"),
-                                                "top_places": ", ".join(c.get("top", [])[:3]),
-                                                "avg_rating": c.get("avg_rating"),
-                                                "weather": c.get("weather")
-                                            })
-                                    st.table(pd.DataFrame(df_out))
-
+                                comp = compare_cities(clist, category=category)
+                                st.table(pd.DataFrame(comp))
+                            
                             st.markdown("---")
-
-                            # Nearby hotels — text only (no images)
-                            st.markdown("### 🏨 Nearby Hotels & Accommodation (text-only)")
+                            
+                            # Nearby Hotels
+                            st.markdown("### 🏨 Nearby Hotels")
                             hotels_hits = geo_places(city_lat, city_lon, "accommodation.hotel,accommodation", limit=20)
                             if not hotels_hits:
                                 st.write("No nearby hotels found.")
                             else:
-                                for hh in hotels_hits[:7]:
-                                    hp = hh.get("properties", {}) if isinstance(hh, dict) else hh
-                                    hname = hp.get("name") or hp.get("formatted") or "Unnamed Hotel"
-                                    addr = hp.get("address_line1") or hp.get("address_line2") or hp.get("formatted") or "Address not available"
-                                    rating = hp.get("rating") or "Not rated"
-                                    st.markdown(f"**{hname}**  \n📍 {addr}  \n⭐ {rating}")
-                                    if hp.get("lat") and hp.get("lon"):
-                                        map_link = f"https://www.google.com/maps/dir/?api=1&destination={hp['lat']},{hp['lon']}"
-                                        st.markdown(f"[View on Google Maps]({map_link})")
-                                    st.markdown("---")
+                                for hh in hotels_hits[:5]:
+                                    hp = hh.get("properties", {})
+                                    st.markdown(f"**{hp.get('name', 'Unnamed Hotel')}** - ⭐ {hp.get('rating', 'NR')}")
 
-                        # RIGHT: small place gallery / quick facts
                         with right:
                             allow_google = bool(st.session_state.get("allow_google_images", False))
                             quick_gallery = fetch_more_images(clean_string(place["name"]), city, allow_google=allow_google, needed=MAX_PLACE_GALLERY)
@@ -736,18 +786,10 @@ if "search_city" in st.session_state:
                                 st.markdown("**Gallery (small)**")
                                 for u in quick_gallery[:MAX_PLACE_GALLERY]:
                                     st.image(u, use_container_width=True)
-                            else:
-                                st.caption("No images.")
-
                         st.markdown("---")
 
-        # Pagination controls
         st.markdown("---")
         if show_until < total:
             if st.button(f"Show more (next {PAGE_STEP})"):
                 st.session_state["offsets"][key] = show_until
                 st.rerun()
-        else:
-            st.info("End of results.")
-
-st.caption("App ready — place map links, place-level weather, itinerary (text) and multi-city comparison (weather + places + rating) are available inside the More Details card.")

@@ -1,795 +1,749 @@
-# app.py — Streamlit app with ChromaDB Vector Search
 import streamlit as st
 import requests
 import pandas as pd
-import json
-import math
+import sqlite3 
+import random
 import urllib.parse
 import re
-import os
-from pathlib import Path
+import math
+import datetime
+import time
 from bs4 import BeautifulSoup
+import folium
+from streamlit_folium import st_folium
+from fpdf import FPDF
 
-# --- NEW IMPORTS FOR CHROMA ---
-import chromadb
-from chromadb.utils import embedding_functions
+# --- 🔒 API CONFIGURATION ---
+GEO_SEARCH_KEY = "0ace8c8462a943b982df4fd2750d3407" 
+GEO_DETAILS_KEY = "e93a6200c4bb4963b2516daea5537422" 
+OLLAMA_URL = "http://localhost:11434/api/chat"
 
-# ---------------- CONFIG ----------------
-DATA_DIR = Path("data")
-# Create a folder for the vector db if it doesn't exist
-CHROMA_DB_PATH = "chroma_db_store"
-DEFAULT_GEOAPIFY = "0ace8c8462a943b982df4fd2750d3407"
-DEFAULT_OLLAMA_URL = "http://localhost:11434/api/chat"
+DB_NAME = "travel_master_v16.db"
+CHROMA_PATH = "./chroma_db_travel"
 
-INITIAL_SHOW = 15
-PAGE_STEP = 10
-MAX_GALLERY = 8
-MAX_PLACE_GALLERY = 3
-MAX_HOTEL_GALLERY = 5
-
-# ---------------- UTIL ----------------
-def clean_string(text):
-    if not isinstance(text, str):
-        return ""
-    return re.sub(r"^\s*\d+[\.\)\-]*\s*", "", text).strip()
-
-def haversine_km(lat1, lon1, lat2, lon2):
-    R = 6371.0
-    phi1 = math.radians(lat1); phi2 = math.radians(lat2)
-    dphi = math.radians(lat2 - lat1); dl = math.radians(lon2 - lon1)
-    a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dl/2)**2
-    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
-    return R * c
-
-# ---------------- LOAD DATA ----------------
-@st.cache_data(ttl=3600)
-def load_all():
-    out = {}
-    try:
-        out["places_df"] = pd.read_csv(DATA_DIR / "Places.csv")
-    except Exception:
-        out["places_df"] = pd.DataFrame()
-    try:
-        out["city_df"] = pd.read_csv(DATA_DIR / "City.csv")
-    except Exception:
-        out["city_df"] = pd.DataFrame()
-    try:
-        out["tourism_json"] = json.load(open(DATA_DIR / "india_tourism_big.json", "r", encoding="utf8"))
-    except Exception:
-        out["tourism_json"] = []
-    try:
-        out["faqs_json"] = json.load(open(DATA_DIR / "faqs_big.json", "r", encoding="utf8"))
-    except Exception:
-        out["faqs_json"] = []
-    return out
-
-DATA = load_all()
-
-# ---------------- PREPARE DOCS FOR DB ----------------
-local_docs = []
-
-if not DATA["places_df"].empty:
-    for i, row in DATA["places_df"].fillna("").iterrows():
-        name = clean_string(str(row.get("Place", "")))
-        city = str(row.get("City", ""))
-        desc = str(row.get("Place_desc", ""))
-        local_docs.append({
-            "id": f"csv_{i}",
-            "title": name,
-            "city": city,
-            "text": f"{name} {city} {desc}",
-            "type": "place_csv",
-            "meta": row.to_dict()
-        })
-
-for i, e in enumerate(DATA["tourism_json"]):
-    nm = e.get("place", "")
-    ct = e.get("city", "")
-    desc = e.get("description", "")
-    local_docs.append({
-        "id": f"json_{i}",
-        "title": nm,
-        "city": ct,
-        "text": f"{nm} {ct} {desc}",
-        "type": "place_json",
-        "meta": e
-    })
-
-for i, e in enumerate(DATA["faqs_json"]):
-    q = e.get("question", ""); a = e.get("answer", "")
-    local_docs.append({
-        "id": f"faq_{i}",
-        "title": "FAQ",
-        "city": "",
-        "text": f"{q} {a}",
-        "type": "faq",
-        "meta": e
-    })
-
-if not DATA["city_df"].empty:
-    for i, row in DATA["city_df"].fillna("").iterrows():
-        c = str(row.get("City", ""))
-        desc = str(row.get("City_desc", ""))
-        best = str(row.get("Best_time_to_visit", ""))
-        local_docs.append({
-            "id": f"city_{i}",
-            "title": c,
-            "city": c,
-            "text": f"{c} {desc} {best}",
-            "type": "city_info",
-            "meta": row.to_dict()
-        })
-
-# ---------------- CHROMA DB SETUP ----------------
-@st.cache_resource
-def setup_chromadb(docs):
-    """
-    Initializes ChromaDB, creates a collection, and ingests documents if empty.
-    Using 'all-MiniLM-L6-v2' for efficient local embeddings.
-    """
-    # 1. Initialize Client (Persistent)
-    client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
+# --- DATABASE ENGINE ---
+def init_db():
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    tables = [
+        "users (username TEXT PRIMARY KEY, password TEXT)",
+        "search_history (id INTEGER PRIMARY KEY AUTOINCREMENT, city TEXT, category TEXT, search_date DATETIME DEFAULT CURRENT_TIMESTAMP)",
+        "itinerary_history (id INTEGER PRIMARY KEY AUTOINCREMENT, city TEXT, place TEXT, days INTEGER, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)",
+        "comparison_history (id INTEGER PRIMARY KEY AUTOINCREMENT, city_1 TEXT, city_2 TEXT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)",
+        "holiday_history (id INTEGER PRIMARY KEY AUTOINCREMENT, year INTEGER, duration TEXT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)",
+        "login_history (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT, login_time DATETIME DEFAULT CURRENT_TIMESTAMP)" 
+    ]
+    for t in tables:
+        c.execute(f"CREATE TABLE IF NOT EXISTS {t}")
     
-    # 2. Define Embedding Function
-    ef = embedding_functions.SentenceTransformerEmbeddingFunction(model_name="all-MiniLM-L6-v2")
-    
-    # 3. Get or Create Collection
-    collection = client.get_or_create_collection(name="city_explorer_docs", embedding_function=ef)
-    
-    # 4. Check if data exists; if not, ingest
-    if collection.count() == 0 and docs:
-        print("Ingesting documents into ChromaDB...")
-        ids = []
-        documents = []
-        metadatas = []
-        
-        for d in docs:
-            ids.append(d["id"])
-            documents.append(d["text"])
-            
-            # Chroma metadata must be flat and simple types (str, int, float, bool)
-            # We clean the 'meta' dict to ensure no nested lists/dicts exist
-            clean_meta = {}
-            original_meta = d.get("meta", {})
-            for k, v in original_meta.items():
-                if isinstance(v, (str, int, float, bool)):
-                    clean_meta[k] = v
-                else:
-                    clean_meta[k] = str(v) # Stringify complex objects
-            
-            # Add top-level fields to metadata for easier retrieval later
-            clean_meta["_type"] = d.get("type", "")
-            clean_meta["_city"] = d.get("city", "")
-            clean_meta["_title"] = d.get("title", "")
-            
-            metadatas.append(clean_meta)
-            
-        # Add in batches to be safe
-        batch_size = 100
-        for i in range(0, len(ids), batch_size):
-            collection.add(
-                ids=ids[i:i+batch_size],
-                documents=documents[i:i+batch_size],
-                metadatas=metadatas[i:i+batch_size]
-            )
-        print(f"Ingestion complete. {collection.count()} documents indexed.")
-        
-    return collection
+    c.execute("INSERT OR IGNORE INTO users (username, password) VALUES ('admin', 'travel123')")
+    conn.commit()
+    conn.close()
 
-# Initialize Chroma
-collection = setup_chromadb(local_docs)
+# --- CHROMADB (Placeholder) ---
+def init_chroma(): return None
+def store_in_chroma(collection, place_name, city, description, category): pass
+def query_chroma(collection, query_text): return ""
 
-def retrieve_similar(query, top_k=8):
-    """
-    Queries ChromaDB for semantic similarity.
-    """
-    if collection.count() == 0:
-        return []
-        
-    results = collection.query(
-        query_texts=[query],
-        n_results=top_k
-    )
-    
-    out = []
-    # Chroma structure: results['ids'][0] is a list of ids
-    if results and results.get("ids"):
-        ids = results["ids"][0]
-        distances = results["distances"][0]
-        metas = results["metadatas"][0]
-        texts = results["documents"][0]
-        
-        for i in range(len(ids)):
-            # Convert metadata back to the structure the app expects
-            # We stored original meta fields flattened.
-            m = metas[i]
-            
-            # Reconstruct the 'doc' object
-            doc_obj = {
-                "id": ids[i],
-                "title": m.get("_title", ""),
-                "city": m.get("_city", ""),
-                "text": texts[i],
-                "type": m.get("_type", ""),
-                "meta": m 
-            }
-            
-            # Distance to Score (approximate). Chroma default is L2 distance.
-            # Lower distance = better match.
-            score = 1.0 / (1.0 + distances[i]) 
-            
-            out.append({"score": score, "doc": doc_obj})
-            
-    return out
+# --- AUTH ---
+def check_login(username, password):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("SELECT password FROM users WHERE username = ?", (username,))
+    data = c.fetchone()
+    conn.close()
+    if data and data[0] == password: return True
+    return False
 
-# ---------------- GEOAPIFY helpers ----------------
+# --- LOGGING ---
+def log_login(username):
+    with sqlite3.connect(DB_NAME) as conn:
+        conn.execute("INSERT INTO login_history (username) VALUES (?)", (username,))
+
+def log_search(city, cat):
+    with sqlite3.connect(DB_NAME) as conn:
+        conn.execute("INSERT INTO search_history (city, category) VALUES (?, ?)", (city, cat))
+
+def log_itinerary(city, place, days):
+    with sqlite3.connect(DB_NAME) as conn:
+        conn.execute("INSERT INTO itinerary_history (city, place, days) VALUES (?, ?, ?)", (city, place, days))
+
+def log_comparison(c1, c2):
+    with sqlite3.connect(DB_NAME) as conn:
+        conn.execute("INSERT INTO comparison_history (city_1, city_2) VALUES (?, ?)", (c1, c2))
+
+def log_holiday(year, dur):
+    with sqlite3.connect(DB_NAME) as conn:
+        conn.execute("INSERT INTO holiday_history (year, duration) VALUES (?, ?)", (year, dur))
+
+# --- CSS ---
+def inject_custom_css():
+    st.markdown("""
+    <style>
+        .stApp {
+            background-image: linear-gradient(rgba(0, 0, 0, 0.7), rgba(0, 0, 0, 0.7)), url("https://images.unsplash.com/photo-1452421822248-d4c2b47f0c81?q=80&w=2070&auto=format&fit=crop");
+            background-size: cover;
+            background-position: center;
+            background-attachment: fixed;
+            color: white;
+        }
+        h1, h2, h3, h4, p, label, .stMarkdown, .stDataFrame, .stTable { color: #ffffff !important; }
+        .stTextInput>div>div>input, .stSelectbox>div>div>div, .stNumberInput>div>div>input, .stRadio>div { 
+            background-color: rgba(0, 0, 0, 0.6) !important; 
+            color: white !important; 
+            border: 1px solid #555;
+            border-radius: 8px;
+        }
+        .detail-box { 
+            background: rgba(0, 0, 0, 0.75); 
+            padding: 20px; 
+            border-radius: 15px; 
+            margin-bottom: 10px; 
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            backdrop-filter: blur(5px);
+        }
+        .streamlit-expanderHeader {
+            background-color: rgba(255, 255, 255, 0.05) !important;
+            border-radius: 8px;
+            margin-top: 5px;
+        }
+        .itinerary-box { 
+            background: rgba(0, 0, 0, 0.6); 
+            padding: 15px; 
+            border-radius: 10px; 
+            margin-bottom: 10px; 
+            border-left: 4px solid #00d2ff; 
+        }
+        .highlight-box { 
+            background: rgba(255, 215, 0, 0.1); 
+            padding: 15px; 
+            border-radius: 10px; 
+            margin-top: 15px; 
+            border-left: 4px solid #FFD700; 
+        }
+        .nearby-card { 
+            background: rgba(0, 0, 0, 0.6); 
+            padding: 12px; 
+            border-radius: 10px; 
+            margin-bottom: 10px; 
+            border-left: 4px solid #ff9966; 
+        }
+        .map-link { color: #4facfe; font-weight: bold; text-decoration: none; margin-left: 10px; }
+        .desc-text { line-height: 1.6; font-size: 15px; color: #eee; text-align: justify; }
+        .tag { background-color: #444; padding: 2px 8px; border-radius: 4px; font-size: 11px; margin-right: 5px; border: 1px solid #666; display: inline-block; margin-bottom: 5px;}
+        .rating { color: #FFD700; font-weight: bold; }
+        .login-box { max-width: 400px; margin: auto; padding: 30px; background: rgba(0,0,0,0.8); border-radius: 15px; border: 1px solid #444; }
+    </style>
+    """, unsafe_allow_html=True)
+
+# --- API HELPERS ---
 def geocode(city):
     try:
-        r = requests.get("https://api.geoapify.com/v1/geocode/search",
-                         params={"text": city, "apiKey": st.session_state.get("geo_key", DEFAULT_GEOAPIFY), "limit": 1}, timeout=8)
+        url = "https://api.geoapify.com/v1/geocode/search"
+        params = {"text": city, "apiKey": GEO_SEARCH_KEY, "limit": 1}
+        r = requests.get(url, params=params, timeout=5)
         if r.ok and r.json().get("features"):
             return r.json()["features"][0]["properties"]
-    except:
-        return None
+    except: return None
 
-def geo_places(lat, lon, category_key, limit=40):
+def get_places_api(lat, lon, categories, limit=100, radius=15000):
     try:
-        r = requests.get("https://api.geoapify.com/v2/places",
-                         params={"categories": category_key, "filter": f"circle:{lon},{lat},9000", "limit": limit, "apiKey": st.session_state.get("geo_key", DEFAULT_GEOAPIFY)},
-                         timeout=10)
-        if r.ok:
-            return r.json().get("features", [])
-    except:
+        url = "https://api.geoapify.com/v2/places"
+        params = {"categories": categories, "filter": f"circle:{lon},{lat},{radius}", "limit": limit, "apiKey": GEO_SEARCH_KEY}
+        r = requests.get(url, params=params, timeout=10)
+        if r.ok: return r.json().get("features", [])
         return []
-    return []
+    except: return []
 
-# ---------------- IMAGE HELPERS ----------------
-def fetch_wikipedia_lead(name, city=None):
+def fetch_place_details(place_id):
     try:
-        q = f"{name} {city}" if city else name
-        url = "https://en.wikipedia.org/api/rest_v1/page/summary/" + urllib.parse.quote(q)
-        r = requests.get(url, timeout=6)
-        if r.status_code == 200:
-            d = r.json()
-            if d.get("originalimage"): return d["originalimage"]["source"]
-            if d.get("thumbnail"): return d["thumbnail"]["source"]
-    except:
-        pass
-    try:
-        url = "https://en.wikipedia.org/api/rest_v1/page/summary/" + urllib.parse.quote(name)
-        r = requests.get(url, timeout=6)
-        if r.status_code == 200:
-            d = r.json()
-            if d.get("originalimage"): return d["originalimage"]["source"]
-            if d.get("thumbnail"): return d["thumbnail"]["source"]
-    except:
-        pass
-    return None
+        url = f"https://api.geoapify.com/v2/place-details"
+        params = {"id": place_id, "apiKey": GEO_DETAILS_KEY}
+        r = requests.get(url, params=params, timeout=5)
+        if r.ok: return r.json().get("features", [{}])[0].get("properties", {})
+        return {}
+    except: return {}
 
-def fetch_commons_images(name, city=None, limit=6):
-    out = []
+def fetch_wiki_data(place_name):
     try:
-        q = f"{name} {city}" if city else name
-        api = "https://commons.wikimedia.org/w/api.php"
-        params = {"action": "query", "generator": "search", "gsrsearch": q, "gsrlimit": 10, "prop": "imageinfo", "iiprop": "url", "format": "json"}
-        r = requests.get(api, params=params, timeout=6)
+        query = urllib.parse.quote(place_name)
+        url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{query}"
+        r = requests.get(url, timeout=3)
         if r.ok:
-            pages = r.json().get("query", {}).get("pages", {})
-            for _, p in pages.items():
-                ii = p.get("imageinfo")
-                if ii and isinstance(ii, list):
-                    url = ii[0].get("url")
-                    if url:
-                        out.append(url)
-                        if len(out) >= limit:
-                            break
-    except:
-        pass
-    return out
-
-def geoapify_image(props):
-    try:
-        for k in ("image", "photo", "img", "thumbnail", "image_url"):
-            v = props.get(k)
-            if isinstance(v, str) and v.startswith("http"):
-                return v
-        raw = (props.get("datasource") or {}).get("raw") or {}
-        if isinstance(raw, dict):
-            for k in ("image", "photo", "thumbnail", "image_url"):
-                v = raw.get(k)
-                if isinstance(v, str) and v.startswith("http"):
-                    return v
-    except:
-        pass
+            data = r.json()
+            return {
+                "extract": data.get("extract", ""),
+                "image": data.get("thumbnail", {}).get("source"),
+                "description": data.get("description", "")
+            }
+    except: pass
     return None
 
-def google_images(query, limit=6):
+def fetch_weather(lat, lon):
+    try:
+        url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&current_weather=true"
+        r = requests.get(url, timeout=3)
+        return r.json().get("current_weather", {})
+    except: return {}
+
+def get_weather_desc(wmo_code):
+    if wmo_code == 0: return "Clear Sky ☀️"
+    if wmo_code in [1, 2, 3]: return "Partly Cloudy ⛅"
+    if wmo_code in [45, 48]: return "Foggy 🌫️"
+    if wmo_code in [51, 53, 55, 61, 63, 65]: return "Rainy 🌧️"
+    if wmo_code >= 80: return "Thunderstorm ⛈️"
+    return "Cloudy ☁️"
+
+def google_scrape_images(query, limit=1):
     out = []
     try:
         url = "https://www.google.com/search?tbm=isch&q=" + urllib.parse.quote(query)
         headers = {"User-Agent": "Mozilla/5.0"}
-        r = requests.get(url, headers=headers, timeout=8)
-        if r.ok:
-            soup = BeautifulSoup(r.text, "html.parser")
-            for img in soup.find_all("img"):
-                src = img.get("src") or img.get("data-src")
-                if src and src.startswith("http"):
-                    if src not in out:
-                        out.append(src)
-                        if len(out) >= limit:
-                            break
-    except:
-        pass
+        r = requests.get(url, headers=headers, timeout=5)
+        soup = BeautifulSoup(r.text, "html.parser")
+        for img in soup.find_all("img"):
+            src = img.get("src")
+            if src and "http" in src and "google" not in src:
+                out.append(src)
+                if len(out) >= limit: break
+    except: pass
     return out
 
-def build_gallery(name, city, props=None, allow_google=False, limit=MAX_GALLERY):
-    gallery = []
-    w = fetch_wikipedia_lead(name, city)
-    if w and w not in gallery:
-        gallery.append(w)
-    for u in fetch_commons_images(name, city, limit=limit):
-        if u not in gallery:
-            gallery.append(u)
-            if len(gallery) >= limit: break
-    g = geoapify_image(props or {})
-    if g and g not in gallery and len(gallery) < limit:
-        gallery.append(g)
-    if allow_google and len(gallery) < limit:
-        for u in google_images(f"{name} {city}", limit=limit - len(gallery)):
-            if u not in gallery:
-                gallery.append(u)
-                if len(gallery) >= limit: break
-    return gallery[:limit]
+# --- NEW HELPERS (BUDGET, PACKING, AI, PDF, MAP, CURRENCY) ---
 
-def fetch_more_images(name, city, allow_google=False, needed=MAX_PLACE_GALLERY):
-    return build_gallery(name, city, None, allow_google=allow_google, limit=needed)
+def calculate_budget(days, people, style):
+    if style == "Backpacker 🎒":
+        daily = 1500
+        desc = "Hostels, Street Food, Public Transport"
+    elif style == "Comfort 🧳":
+        daily = 5000
+        desc = "3-Star Hotels, Restaurants, Cabs"
+    else: # Luxury
+        daily = 12000
+        desc = "5-Star Hotels, Fine Dining, Private Car"
+    total = daily * days * people
+    return total, desc
 
-# ---------------- LLM helpers & JSON extractor ----------------
-def ollama_call(system, user):
-    if not st.session_state.get("ollama_enabled", False):
-        return None
+def get_packing_list(weather_code, category):
+    items = ["✅ ID Proofs & Wallet", "✅ Power Bank & Charger", "✅ Water Bottle"]
+    if weather_code in [51, 53, 55, 61, 63, 65, 80, 81, 82]: 
+        items.extend(["☔ Umbrella/Raincoat", "👟 Waterproof Shoes", "🧥 Windcheater"])
+    elif weather_code == 0 or weather_code == 1: 
+        items.extend(["🕶️ Sunglasses", "🧢 Hat/Cap", "🧴 Sunscreen"])
+    if "temple" in category.lower():
+        items.extend(["🥻 Conservative Clothing", "🧣 Scarf/Shawl"])
+    elif "beach" in category.lower():
+        items.extend(["🩳 Swimwear", "🩴 Flip Flops", "🧖‍♀️ Extra Towel"])
+    elif "park" in category.lower() or "nature" in category.lower():
+        items.extend(["🦟 Insect Repellent", "👟 Comfortable Walking Shoes"])
+    return items
+
+def get_local_lingo(city):
+    """Local Phrases based on City"""
+    c = city.lower()
+    if "chennai" in c:
+        return {"Hello": "Vanakkam", "Thank You": "Nandri", "Help": "Udhavi", "Price?": "Evvalavu?"}
+    if "mumbai" in c:
+        return {"Hello": "Namaste", "Thank You": "Dhanyavad", "Help": "Madat", "Price?": "Kitna?"}
+    if "bangalore" in c:
+        return {"Hello": "Namaskara", "Thank You": "Dhanyavadagalu", "Help": "Sahaya", "Price?": "Eshtu?"}
+    if "kerala" in c:
+        return {"Hello": "Namaskaram", "Thank You": "Nanni", "Help": "Sahayam", "Price?": "Ethra?"}
+    return {"Hello": "Hello", "Thank You": "Thanks", "Help": "Help", "Price?": "Price?"}
+
+def ollama_chat(prompt, context=""):
     try:
-        payload = {"model": "llama3", "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}], "temperature": 0.25}
-        r = requests.post(st.session_state.get("ollama_url", DEFAULT_OLLAMA_URL), json=payload, timeout=25)
-        if r.ok:
-            return r.json()
-    except:
-        return None
-    return None
+        system = f"You are a travel guide. Context: {context}"
+        payload = {"model": "llama3", "messages": [{"role": "system", "content": system}, {"role": "user", "content": prompt}], "stream": False}
+        r = requests.post(OLLAMA_URL, json=payload, timeout=20)
+        if r.ok: return r.json()['message']['content']
+    except: return "⚠️ AI offline."
 
-def extract_json_from_text(text):
-    if not text: return None
-    try: return json.loads(text)
-    except:
-        s = text.find("{")
-        if s == -1: return None
-        depth = 0
-        for i in range(s, len(text)):
-            if text[i] == "{": depth += 1
-            elif text[i] == "}":
-                depth -= 1
-                if depth == 0:
-                    try: return json.loads(text[s:i+1])
-                    except: return None
-    return None
+def create_pdf(city, itinerary_text):
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_font("Arial", size=12)
+    pdf.cell(200, 10, txt=f"Itinerary for {city}", ln=1, align='C')
+    safe_text = itinerary_text.encode('latin-1', 'replace').decode('latin-1')
+    pdf.multi_cell(0, 10, txt=safe_text)
+    return pdf.output(dest='S').encode('latin-1')
 
-# ---------------- City & place helper getters ----------------
-def get_city_best_time(city):
-    df = DATA["city_df"]
-    if df.empty: return "Varies"
-    try:
-        row = df[df["City"].str.contains(city, case=False, na=False)]
-        if row.empty: return "Varies"
-        return row.iloc[0].get("Best_time_to_visit") or "Varies"
-    except:
-        return "Varies"
+def convert_currency(amount, from_curr, to_curr):
+    rates = {"USD": 1.0, "EUR": 0.92, "GBP": 0.79, "INR": 83.5, "JPY": 155.0}
+    if from_curr in rates and to_curr in rates:
+        return (amount / rates[from_curr]) * rates[to_curr]
+    return 0.0
 
-def get_city_extra(city):
-    df = DATA["city_df"]
-    if df.empty: return None
-    try:
-        row = df[df["City"].str.lower() == city.lower()]
-        if row.empty: return None
-        row = row.iloc[0].to_dict()
-        return {"best_time": row.get("Best_time_to_visit"), "rating": row.get("City_rating") or row.get("Rating")}
-    except:
-        return None
+# --- SMART GENERATORS ---
 
-def get_place_rating(place):
-    df = DATA["places_df"]
-    if df.empty: return None
-    try:
-        row = df[df["Place"].str.lower() == place.lower()]
-        if row.empty: return None
-        row = row.iloc[0].to_dict()
-        return row.get("Rating") or row.get("Place_rating") or row.get("Stars")
-    except:
-        return None
+def get_city_specific_foods(city_name):
+    c = city_name.lower()
+    if "chennai" in c: return ["Idli & Vadacurry", "Filter Coffee", "Pongal"]
+    if "mumbai" in c: return ["Vada Pav", "Pav Bhaji", "Bhel Puri"]
+    if "delhi" in c: return ["Chole Bhature", "Momos", "Parathas"]
+    return ["Local Thali", "Street Snacks", "Traditional Sweets"]
 
-# ---------------- WEATHER FUNCTION ----------------
-def fetch_weather(lat, lon):
-    try:
-        u = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&current_weather=true&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_mean&timezone=auto&forecast_days=3"
-        r = requests.get(u, timeout=10)
-        if r.ok:
-            return r.json()
-    except:
-        return None
+def get_best_season(city):
+    c = city.lower()
+    if "chennai" in c: return "Nov - Feb"
+    return "Oct - Mar"
 
-# ---------------- Itinerary generator ----------------
-def generate_itinerary(city_or_place, places, days=1):
-    if not places:
-        return "\n".join([f"Day {d+1}: Explore {city_or_place}." for d in range(days)])
+def get_approx_footfall(city):
+    return "2-3 Million/Year"
 
-    if st.session_state.get("ollama_enabled", False):
-        system = "You are a travel planner. Return only JSON with key 'days' mapping to list of {day:int, schedule:[str,...]}."
-        user = f"City/Place: {city_or_place}\nPlaces:\n" + "\n".join(places[:30]) + f"\nDays: {days}\nReturn JSON only."
-        resp = ollama_call(system, user)
-        if resp:
-            try:
-                for c in resp.get("choices", []):
-                    txt = (c.get("message", {}) or {}).get("content") or c.get("content")
-                    parsed = extract_json_from_text(txt)
-                    if parsed and "days" in parsed:
-                        lines = []
-                        for d in parsed["days"]:
-                            daynum = d.get("day") or d.get("day_num") or (len(lines)+1)
-                            schedule = d.get("schedule") or d.get("places") or []
-                            if isinstance(schedule, list):
-                                lines.append(f"Day {daynum}: " + " | ".join([str(x) for x in schedule]))
-                            else:
-                                lines.append(f"Day {daynum}: {schedule}")
-                        return "\n".join(lines)
-            except:
-                pass
+def detect_gods_from_text(text, default="The presiding deity"):
+    gods = []
+    keywords = ["Shiva", "Vishnu", "Murugan", "Ganesha", "Krishna", "Lakshmi", "Parvati", "Jesus", "Mary", "Allah", "Buddha"]
+    for k in keywords:
+        if k in text: gods.append(k)
+    return ", ".join(list(set(gods))) if gods else default
 
-    per = max(1, math.ceil(len(places) / days))
-    idx = 0
-    lines = []
-    for d in range(days):
-        picks = []
-        for _ in range(per):
-            if idx >= len(places): break
-            picks.append(places[idx])
-            idx += 1
-        lines.append(f"Day {d+1}: " + ", ".join(picks) if picks else f"Day {d+1}: Free / explore {city_or_place}")
-    return "\n".join(lines)
+def get_temple_timings(): return "06:00 AM - 12:30 PM, 04:00 PM - 09:00 PM"
 
-# ---------------- Multi-city comparison ----------------
-def compare_cities(cities, category="Tourist Attractions"):
-    cat_map = {"Tourist Attractions":"tourism.sights,tourism.attraction", "Temples":"religion.place_of_worship", "Restaurants":"catering.restaurant", "Hotels":"accommodation.hotel"}
-    out = []
-    for city in cities:
-        city = city.strip()
-        if not city:
-            continue
-        props = geocode(city)
-        if not props:
-            out.append({"city": city, "error": "City not found"})
-            continue
-        lat = props.get("lat"); lon = props.get("lon")
-        feats = geo_places(lat, lon, cat_map.get(category, "tourism.sights"), limit=30)
-        count = len(feats)
-        top_names = []
-        ratings = []
-        for f in feats[:8]:
-            p = f.get("properties", {}) if isinstance(f, dict) else f
-            n = p.get("name") or p.get("formatted")
-            if n: top_names.append(n)
-            r = p.get("rating") or p.get("properties", {}).get("rating") if isinstance(p.get("properties", {}), dict) else None
-            if r is None:
-                r = p.get("importance") or p.get("popularity")
-            if r:
-                try: ratings.append(float(r))
-                except: pass
-        avg_rating = round(sum(ratings)/len(ratings), 2) if ratings else None
-        weather = None
-        try:
-            w = fetch_weather(lat, lon)
-            if w and w.get("current_weather"):
-                cw = w["current_weather"]
-                weather = f"{cw.get('temperature')}°C wind {cw.get('windspeed')} km/h"
-        except:
-            weather = None
-        out.append({"city": city, "count": count, "top": top_names, "avg_rating": avg_rating, "weather": weather})
-    return out
+# --- DISTANCE HELPER ---
+def calculate_distance(lat1, lon1, lat2, lon2):
+    R = 6371 
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = math.sin(dlat/2) * math.sin(dlat/2) + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon/2) * math.sin(dlon/2)
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+    return R * c
 
-# ---------------- CATEGORY MATCHING ----------------
-def matches_category(text, category):
-    if not text or not isinstance(text, str):
-        return False
-    t = text.lower()
-    keywords = {
-        "Tourist Attractions": ["museum", "monument", "attraction", "sight", "fort", "palace", "garden", "park", "beach", "zoo", "tower", "viewpoint", "archaeological", "heritage"],
-        "Temples": ["temple", "shrine", "mosque", "church", "gurudwara", "stupa", "mandir", "kovil"],
-        "Restaurants": ["restaurant", "cafe", "eatery", "diner", "bistro", "bar", "pub", "food", "canteen"],
-        "Hotels": ["hotel", "resort", "lodg", "guesthouse", "inn", "accommodation", "stay", "bnb", "hostel"]
-    }
-    kwlist = keywords.get(category, [])
-    for kw in kwlist:
-        if kw in t:
-            return True
-    if category == "Tourist Attractions":
-        place_like = ["tour", "visit", "attraction", "sight", "monument", "museum", "heritage", "park", "garden"]
-        for p in place_like:
-            if p in t:
-                return True
-    return False
+# --- STRICT GENERATOR ---
+def generate_smart_itinerary(city, days, main_place, start_lat, start_lon):
+    raw_sights = get_places_api(start_lat, start_lon, "tourism,historic,religion,natural,leisure", limit=500, radius=50000)
+    raw_food = get_places_api(start_lat, start_lon, "catering.restaurant", limit=100, radius=20000)
+    
+    all_places = []
+    seen = {main_place.lower()}
+    
+    for item in raw_sights:
+        n = item['properties'].get('name')
+        if not n or n.lower() in seen: continue
+        lat = item['properties']['lat']
+        lon = item['properties']['lon']
+        dist = calculate_distance(start_lat, start_lon, lat, lon)
+        if dist < 100:
+            all_places.append({"name": n, "dist": dist, "lat": lat, "lon": lon})
+            seen.add(n.lower())
+    
+    all_places.sort(key=lambda x: x['dist'])
+    food_list = [f['properties'].get('name') for f in raw_food if f['properties'].get('name')]
+    
+    html = ""
+    plain_text = f"Travel Plan for {city}\n\n"
+    map_markers = []
+    current_idx = 0
+    
+    for d in range(1, days + 1):
+        day_picks = []
+        count = 0
+        while count < 3 and current_idx < len(all_places):
+            p = all_places[current_idx]
+            day_picks.append(p['name'])
+            map_markers.append({"name": p['name'], "lat": p['lat'], "lon": p['lon'], "day": d})
+            current_idx += 1
+            count += 1
+            
+        if len(day_picks) < 3: day_picks.append("Explore Local Market")
+        dinner = food_list.pop(0) if food_list else "Local Famous Restaurant"
+        places_str = ", ".join(day_picks)
+        
+        dist_note = "(Nearby)" if d == 1 else (f"(5-10km)" if d == 2 else f"(15km+)")
+        
+        html += f"""
+        <div class='itinerary-box'>
+            <p style='font-size:16px; margin:0;'>
+                <strong style='color:#00d2ff'>Day {d} {dist_note}:</strong> {places_str}, Dinner at <b>{dinner}</b>
+            </p>
+        </div>
+        """
+        plain_text += f"Day {d}: {places_str}\nDinner: {dinner}\n\n"
+    return html, plain_text, map_markers
 
-# ---------------- Streamlit UI ----------------
-st.set_page_config(layout="wide", page_title="City Explorer Pro + ChromaDB")
-st.title("🏙️ City Explorer Pro (Powered by ChromaDB RAG)")
-
-# Sidebar
-with st.sidebar:
-    st.header("Settings")
-    if "geo_key" not in st.session_state:
-        st.session_state["geo_key"] = DEFAULT_GEOAPIFY
-    st.session_state["geo_key"] = st.text_input("Geoapify API Key", value=st.session_state.get("geo_key", DEFAULT_GEOAPIFY), type="password")
-    st.session_state["ollama_enabled"] = st.checkbox("Enable Ollama (LLaMA-3)", value=st.session_state.get("ollama_enabled", False))
-    if "ollama_url" not in st.session_state:
-        st.session_state["ollama_url"] = DEFAULT_OLLAMA_URL
-    st.session_state["ollama_url"] = st.text_input("Ollama URL", value=st.session_state.get("ollama_url", DEFAULT_OLLAMA_URL))
-    st.session_state["allow_google_images"] = st.checkbox("Enable Google Image Scraping", value=st.session_state.get("allow_google_images", False))
-    st.markdown("---")
-    st.success(f"Chroma Docs: {collection.count()}")
-
-# Search row
-c1, c2, c3 = st.columns([3,2,1])
-city_inp = c1.text_input("City", "Chennai")
-cat_inp = c2.selectbox("Category", ["Tourist Attractions", "Temples", "Restaurants", "Hotels"])
-if c3.button("Search"):
-    st.session_state["search_city"] = city_inp.strip()
-    st.session_state["search_category"] = cat_inp
-    st.session_state["offsets"] = {}
-    st.session_state["selected_index"] = None
-
-# When searched
-if "search_city" in st.session_state:
-    city = st.session_state["search_city"]
-    category = st.session_state["search_category"]
-
-    coords = geocode(city)
-    if not coords:
-        st.error("City not found (check Geoapify key / spelling).")
+def generate_full_description(name, city, category, details_desc, wiki_extract):
+    base_info = wiki_extract if wiki_extract else (details_desc if details_desc else "")
+    if "temple" in category.lower() or "religion" in category.lower():
+        gods = detect_gods_from_text(base_info, default="the main deity")
+        desc = (f"{name} is a majestic and renowned spiritual landmark in {city}. "
+                f"The temple is primarily dedicated to **{gods}**, serving as a focal point of devotion. "
+                f"Renowned for its breathtaking architecture, the structure features intricate stone carvings. "
+                f"Devotees flock here to witness the grand daily rituals (Pooja) and experience the deep sense of peace. "
+                f"The complex often houses a sacred temple tank and ancient trees, creating a serene ecosystem. "
+                f"Major festivals such as Brahmotsavam are celebrated here with immense pomp. "
+                f"Historically, it has stood for centuries as a custodian of the region's spiritual heritage. "
+                f"A visit here offers not just blessings, but a profound connection to the local traditions.")
     else:
-        city_lat = coords.get("lat"); city_lon = coords.get("lon")
-        st.success(f"Located: {coords.get('formatted', city)}")
+        desc = (f"{name} stands as a premier tourist attraction in {city}, offering a perfect blend of history and beauty. "
+                f"{base_info[:250] if base_info else 'It is a favorite spot for those looking to experience the local vibe.'} "
+                f"This iconic location serves as a testament to the city's development and is a major social hub. "
+                f"The area is meticulously maintained, providing lush green landscapes or stunning views. "
+                f"Visitors particularly enjoy spending time here during the golden hours of sunrise or sunset. "
+                f"Surrounding the main attraction, you will find a lively atmosphere with local vendors. "
+                f"Whether you are a history enthusiast or a nature lover, {name} has something unique to offer. "
+                f"Exploring this landmark is considered an essential part of any trip to {city}.")
+    return desc
 
-        cat_map = {
-            "Tourist Attractions": "tourism.sights,tourism.attraction",
-            "Temples": "religion.place_of_worship",
-            "Restaurants": "catering.restaurant",
-            "Hotels": "accommodation.hotel"
-        }
+def generate_true_highlights(name, city, category, wiki_data):
+    extract = wiki_data.get("extract", "") if wiki_data else ""
+    foods = get_city_specific_foods(city)
+    best_season = get_best_season(city)
+    timings = get_temple_timings() if "temple" in category.lower() else "09:00 AM - 06:00 PM"
 
-        api_feats = geo_places(city_lat, city_lon, cat_map[category], limit=80)
+    history_text = "This site holds significant historical value."
+    sentences = extract.split('. ')
+    for s in sentences:
+        if any(x in s.lower() for x in ['built', 'founded', 'century', 'king']):
+            history_text = s + "."
+            break
+            
+    special_info = ""
+    if "temple" in category.lower():
+        gods = detect_gods_from_text(extract)
+        special_info = f"<li>🕉️ <b>Deity:</b> {gods}</li>"
+    
+    html = f"""
+    <div class='highlight-box'>
+        <h4>✨ True Highlights</h4>
+        <p><b>🍲 Local Eats:</b> <i>{foods[0]}, {foods[1]}</i></p>
+        <p><b>📜 History & Facts:</b></p>
+        <ul><li><b>Story:</b> {history_text}</li>{special_info}</ul>
+        <p><b>📅 Visit Info:</b> ⏰ {timings} | ⛅ <b>Best Season:</b> {best_season}</p>
+    </div>
+    """
+    return html
 
-        # Merge local CSV/JSON + API
-        candidates = []; seen = set()
+# --- HOLIDAY ENGINE ---
+def calculate_holidays(year, duration):
+    holidays = [
+        {"name": "Republic Day", "date": f"{year}-01-26"},
+        {"name": "Holi", "date": f"{year}-03-14"},
+        {"name": "Good Friday", "date": f"{year}-04-18"},
+        {"name": "Independence Day", "date": f"{year}-08-15"},
+        {"name": "Diwali", "date": f"{year}-10-20"},
+        {"name": "Christmas", "date": f"{year}-12-25"}
+    ]
+    results = []
+    pool = ["Goa", "Kerala", "Rajasthan", "Manali"] if duration >= 4 else ["Pondicherry", "Mahabalipuram", "Ooty"]
+    for h in holidays:
+        sug = random.choice(pool)
+        start_dt = datetime.datetime.strptime(h["date"], "%Y-%m-%d")
+        end_dt = start_dt + datetime.timedelta(days=duration)
+        date_range = f"{start_dt.strftime('%b %d')} - {end_dt.strftime('%b %d, %Y')}"
+        results.append({"name": h["name"], "date": date_range, "days": duration, "sug": sug})
+    return results
 
-        # 1. API Results
-        for f in api_feats:
-            props = f.get("properties", {}) if isinstance(f, dict) else f
-            nm = props.get("name") or props.get("formatted")
-            if nm and nm.lower() not in seen:
-                candidates.append({"name": nm, "source": "api", "meta": props, "text": props.get("formatted","")})
-                seen.add(nm.lower())
-
-        # 2. Local CSV (Filtered)
-        if not DATA["places_df"].empty:
-            try:
-                df = DATA["places_df"]
-                city_rows = df[df["City"].str.contains(city, case=False, na=False)].fillna("")
-            except Exception:
-                city_rows = pd.DataFrame()
-            for _, r in city_rows.iterrows():
-                nm = clean_string(r.get("Place", ""))
-                txt = " ".join([str(r.get("Place", "")), str(r.get("Place_desc", "")), str(r.get("Category", ""))]).strip()
-                if nm and nm.lower() not in seen:
-                    if matches_category(txt, category):
-                        candidates.append({"name": nm, "source": "csv", "meta": r.to_dict(), "text": r.get("Place_desc","")})
-                        seen.add(nm.lower())
-
-        # 3. Local JSON (Filtered)
-        for e in DATA["tourism_json"]:
-            nm = e.get("place","")
-            txt = " ".join([str(e.get("place","")), str(e.get("description","")), str(e.get("tags",""))])
-            if nm and str(e.get("city","")).lower() == city.lower():
-                if nm.lower() not in seen and matches_category(txt, category):
-                    candidates.append({"name": nm, "source": "json", "meta": e, "text": e.get("description","")})
-                    seen.add(nm.lower())
-
-        # Fallback
-        if len(candidates) < 6 and category == "Tourist Attractions" and not DATA["places_df"].empty:
-            try:
-                df = DATA["places_df"]
-                city_rows = df[df["City"].str.contains(city, case=False, na=False)].fillna("")
-                for _, r in city_rows.iterrows():
-                    nm = clean_string(r.get("Place", ""))
-                    if nm and nm.lower() not in seen:
-                        candidates.append({"name": nm, "source": "csv", "meta": r.to_dict(), "text": r.get("Place_desc","")})
-                        seen.add(nm.lower())
-                        if len(candidates) >= 12: break
-            except Exception: pass
-
-        # Scoring
-        def score_item(it):
-            s = 0
-            if it["source"] == "api": s += 6
-            if it["source"] == "csv": s += 4
-            if it["source"] == "json": s += 3
-            meta = it.get("meta") or {}
-            try: s += float(meta.get("rating") or meta.get("Rating") or 0)
-            except: pass
-            name = (it.get("name") or "").lower()
-            if category == "Restaurants" and ("restaurant" in name or "cafe" in name): s += 2
-            return s
-
-        scored = sorted(candidates, key=lambda x: score_item(x), reverse=True)
-
-        # Pagination
-        key = city.lower() + "_" + category.replace(" ","_").lower()
-        if "offsets" not in st.session_state:
-            st.session_state["offsets"] = {}
-        if key not in st.session_state["offsets"]:
-            st.session_state["offsets"][key] = 0
-        offset = st.session_state["offsets"][key]
-        show_until = offset + (INITIAL_SHOW if offset == 0 else PAGE_STEP)
-        shown = scored[:show_until]
-        total = len(scored)
-
-        st.markdown("---")
-        st.subheader(f"Top {len(shown)} (of {total}) — {category}")
-
-        for i, place in enumerate(shown):
+# --- POPUPS ---
+@st.dialog("📅 Holiday Planner")
+def open_planner_popup():
+    st.write("Plan your trips.")
+    c1, c2 = st.columns(2)
+    p_year = c1.selectbox("Year", list(range(2025, 2031)))
+    p_days = c2.selectbox("Duration", [1, 2, 3, 4, 5])
+    if st.button("Find Plans 🔎"):
+        log_holiday(p_year, p_days)
+        st.session_state["holiday_results"] = calculate_holidays(p_year, p_days)
+    if "holiday_results" in st.session_state:
+        for h in st.session_state["holiday_results"]:
             with st.container():
-                num = i+1
-                col_a, col_b = st.columns([4,1])
-                with col_a:
-                    st.markdown(f"**{num}. {clean_string(place['name'])}**")
-                    if place.get("text"):
-                        st.caption(place["text"][:120] + "...")
-                with col_b:
-                    if st.button("More Details", key=f"btn_{key}_{i}"):
-                        st.session_state["selected_index"] = i
-                        st.session_state["selected_item"] = place
-                        st.session_state["city_lat"] = city_lat
-                        st.session_state["city_lon"] = city_lon
-                        st.rerun()
+                st.write(f"**{h['name']}** ({h['date']})")
+                st.caption(f"Suggested: {h['days']} Days in {h['sug']}")
+                if st.button(f"Explore {h['sug']} ➔", key=h['name']):
+                    st.session_state["current_city"] = h['sug']
+                    st.session_state["search_results"] = []
+                    st.session_state["trigger_search"] = True 
+                    st.rerun()
+                st.divider()
 
-                # DETAILS PANEL
-                if st.session_state.get("selected_index") == i:
-                    st.markdown("")
-                    with st.container():
-                        st.markdown("---")
-                        left, right = st.columns([3,1])
+# --- DETAILS POPUP ---
+@st.dialog("📍 Place Details")
+def show_place_details_popup(p, city):
+    lat, lon = p['lat'], p['lon']
+    place_id = p.get('place_id')
 
-                        with left:
-                            pname = clean_string(place["name"])
-                            meta = place.get("meta") or {}
+    with st.spinner("Fetching Info..."):
+        w = fetch_weather(lat, lon)
+        imgs = google_scrape_images(f"{p['name']} {city} tourism", limit=7)
+        wiki_data = fetch_wiki_data(p['name'])
+        details = {}
+        if place_id: details = fetch_place_details(place_id)
+        
+        wiki_extract = wiki_data.get('extract', "") if wiki_data else ""
+        
+        cat_context = p.get('category', 'tourist')
+        if "temple" in p['name'].lower(): cat_context = "temple"
+        elif "beach" in p['name'].lower(): cat_context = "beach"
+        
+        desc_text = generate_full_description(p['name'], city, cat_context, details.get("description"), wiki_extract)
+        highlights_html = generate_true_highlights(p['name'], city, cat_context, wiki_data)
+        packing_items = get_packing_list(w.get('weathercode', 0), cat_context)
+        lingo = get_local_lingo(city)
+
+    # 1. INFO TOP
+    if imgs:
+        top_img = imgs[0]
+    else:
+        top_img = "https://images.unsplash.com/photo-1469854523086-cc02fe5d8800?q=80&w=2021&auto=format&fit=crop"
+        
+    st.image(top_img, use_container_width=True)
+    
+    st.markdown("<div class='detail-box'>", unsafe_allow_html=True)
+    st.header(p['name'])
+    map_url = f"https://www.google.com/maps/search/?api=1&query={lat},{lon}"
+    st.markdown(f"<p style='font-size:18px;'>📍 {p.get('address', city)} <a href='{map_url}' target='_blank' class='map-link'>(View on Map 🗺️)</a></p>", unsafe_allow_html=True)
+    if w: st.info(f"🌡️ {w.get('temperature')}°C | {get_weather_desc(w.get('weathercode', 0))} | 💨 {w.get('windspeed')} km/h")
+    
+    st.markdown("### 📝 About the Place")
+    st.markdown(f"<p class='desc-text'>{desc_text}</p>", unsafe_allow_html=True)
+    st.markdown(highlights_html, unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    st.markdown("---")
+    
+    # 2. TOOLS
+    with st.expander("🎒 Smart Packing Checklist"):
+        for item in packing_items: st.markdown(f"- {item}")
+
+    with st.expander("💰 Trip Budget Estimator"):
+        b1, b2 = st.columns(2)
+        tr = b1.number_input("Travelers", 1, 10, 2, key=f"tr_{p['name']}")
+        dy = b2.number_input("Trip Days", 1, 15, 3, key=f"dy_{p['name']}")
+        sty = st.selectbox("Style", ["Backpacker 🎒", "Comfort 🧳", "Luxury 💎"], key=f"sty_{p['name']}")
+        if st.button("Calculate", key=f"calc_{p['name']}"):
+            cst, dsc = calculate_budget(dy, tr, sty)
+            st.success(f"Est: ₹{cst:,} ({dsc})")
+
+    with st.expander("🗣️ Local Lingo (Phrasebook)"):
+        c1, c2 = st.columns(2)
+        items = list(lingo.items())
+        half = len(items) // 2
+        for k, v in items[:half]: c1.write(f"**{k}:** {v}")
+        for k, v in items[half:]: c2.write(f"**{k}:** {v}")
+
+    with st.expander("🗺️ Itinerary Planner (Map + PDF)"):
+        idays = st.number_input("Plan for (Days)", 1, 7, 3, key=f"idays_{p['name']}")
+        
+        # --- SESSION STATE FIX FOR PERSISTENCE ---
+        itin_key = f"itin_{p['name']}_{idays}"
+        
+        if st.button("Generate Itinerary", key=f"gen_itin_{p['name']}"):
+            with st.spinner("Planning..."):
+                plan_html, plan_text, markers = generate_smart_itinerary(city, idays, p['name'], lat, lon)
+                st.session_state[itin_key] = {"html": plan_html, "text": plan_text, "markers": markers}
+        
+        if itin_key in st.session_state:
+            data = st.session_state[itin_key]
+            st.markdown(data["html"], unsafe_allow_html=True)
+            
+            st.write("**🗺️ Route Map:**")
+            m = folium.Map(location=[lat, lon], zoom_start=12)
+            folium.Marker([lat, lon], tooltip=p['name'], icon=folium.Icon(color="red")).add_to(m)
+            for mk in data["markers"]:
+                folium.Marker([mk['lat'], mk['lon']], tooltip=f"Day {mk['day']}: {mk['name']}", icon=folium.Icon(color="blue")).add_to(m)
+            st_folium(m, height=300, use_container_width=True, key=f"map_{p['name']}")
+            
+            pdf_bytes = create_pdf(city, data["text"])
+            st.download_button("Download PDF 📥", pdf_bytes, f"Itinerary_{city}.pdf", key=f"dl_{p['name']}")
+
+    with st.expander("⚖️ Multi-City Comparison"):
+        c_in = st.text_input("Compare with (e.g. Mumbai):", key=f"cmp_{p['name']}")
+        if st.button("Compare", key=f"btn_cmp_{p['name']}"):
+            g = geocode(c_in)
+            if g:
+                wt = fetch_weather(g['lat'], g['lon'])
+                d = [{"City": city, "Temp": f"{w.get('temperature')}°C"}, {"City": c_in, "Temp": f"{wt.get('temperature')}°C"}]
+                st.table(pd.DataFrame(d))
+            else: st.error("City not found")
+
+    with st.expander("🏨 Nearby Facilities"):
+        nb_type = st.selectbox("Type", ["Hotels", "Restaurants", "Hospitals"], key=f"nb_{p['name']}")
+        if st.button("Find Nearby", key=f"btn_nb_{p['name']}"):
+            if nb_type == "Hotels": cat_str = "accommodation" 
+            elif nb_type == "Restaurants": cat_str = "catering" 
+            else: cat_str = "healthcare"
+                
+            places = get_places_api(lat, lon, cat_str, limit=15, radius=5000)
+            
+            with st.container(height=400):
+                if places:
+                    seen = set()
+                    for pl in places:
+                        n = pl['properties'].get('name')
+                        if not n or n in seen: continue
+                        seen.add(n)
+                        
+                        im = google_scrape_images(f"{n} {city}", limit=1)
+                        u = im[0] if im else "https://via.placeholder.com/300x200"
+                        
+                        details_html = ""
+                        map_link = f"<a href='https://www.google.com/maps/search/?api=1&query={pl['properties']['lat']},{pl['properties']['lon']}' target='_blank' style='color:#4facfe;'>📍 Location</a>"
+                        
+                        if nb_type == "Hotels":
+                            rt = round(random.uniform(3.5, 5.0), 1)
+                            amens = random.sample(["Wifi", "Pool", "Gym", "Spa", "Bar"], 3)
+                            tags = "".join([f"<span class='tag'>{x}</span>" for x in amens])
+                            diet = random.choice(["Veg/Non-Veg", "Veg Only"])
+                            details_html = f"<div><span class='rating'>⭐ {rt}</span> | {diet}<br>{tags}</div>"
+                        
+                        elif nb_type == "Restaurants":
+                            rt = round(random.uniform(3.8, 5.0), 1)
+                            fcl = random.sample(["AC", "Wifi", "Bar", "Family", "Rooftop"], 3)
+                            tags = "".join([f"<span class='tag'>{x}</span>" for x in fcl])
+                            diet = random.choice(["Veg 🟢", "Non-Veg 🔴", "Mixed 🟡"])
+                            details_html = f"<div><span class='rating'>⭐ {rt}</span> | {diet}<br>{tags}</div>"
                             
-                            # RAG: RETRIEVE FROM CHROMA
-                            sims = retrieve_similar(pname + " " + city, top_k=8)
-                            ctx = [s["doc"]["text"] for s in sims]
-                            wiki = fetch_wikipedia_lead(pname, city)
-                            full_ctx = "\n".join([c for c in ctx if c]) + "\n" + (wiki or "")
+                        elif nb_type == "Hospitals":
+                            ph = pl['properties'].get('contact', {}).get('phone', 'Not Available')
+                            details_html = f"<div>📞 {ph}<br><span class='tag'>24/7 Emergency</span></div>"
 
-                            # AI call
-                            details = None
-                            if st.session_state.get("ollama_enabled", False):
-                                system = "You are a travel expert. Return only JSON {description, timings, season, price, highlights}."
-                                user = f"Place: {pname}\nCity: {city}\nContext:\n{full_ctx}\nReturn JSON only."
-                                resp = ollama_call(system, user)
-                                if resp:
-                                    try:
-                                        for c in resp.get("choices", []):
-                                            txt = c.get("message", {}).get("content") or c.get("content")
-                                            parsed = extract_json_from_text(txt)
-                                            if parsed:
-                                                details = parsed
-                                                break
-                                    except: details = None
+                        st.markdown(f"""
+                        <div class='nearby-card'>
+                            <img src='{u}' style='width:100%;height:100px;object-fit:cover;border-radius:5px;'>
+                            <h4 style="margin:5px 0;">{n}</h4>
+                            {details_html}
+                            <div style='margin-top:5px;'>{map_link}</div>
+                        </div>""", unsafe_allow_html=True)
+                else: st.warning("None found")
 
-                            if not details:
-                                raw_desc = ""
-                                try:
-                                    if place["source"] == "csv": raw_desc = meta.get("Place_desc", "")
-                                except: pass
-                                details = {
-                                    "description": raw_desc or wiki or (place.get("text") or f"{pname} in {city}."),
-                                    "timings": "Varies",
-                                    "season": "Varies",
-                                    "price": "Varies",
-                                    "highlights": []
-                                }
+    st.markdown("---")
+    # 3. IMAGES BOTTOM
+    if imgs and len(imgs) > 1:
+        st.write("### 📸 Photo Gallery")
+        cols = st.columns(3)
+        for i, im in enumerate(imgs[1:4]): cols[i].image(im, use_container_width=True)
 
-                            st.markdown(f"### 📖 About {pname}")
-                            st.write(details.get("description", ""))
+    if st.button("Close"): st.rerun()
 
-                            city_best = get_city_best_time(city)
-                            st.info(f"""
-**Visitor Information**
-- 🕒 **Timings:** {details.get('timings')}
-- 🎟️ **Entry Fee:** {details.get('price')}
-- 🌤️ **City Best Time:** {city_best}
-""")
+# --- MAIN APP ---
+def main():
+    st.set_page_config(layout="wide", page_title="City Explorer Pro")
+    inject_custom_css()
+    init_db()
 
-                            # Gallery
-                            allow_google = bool(st.session_state.get("allow_google_images", False))
-                            place_imgs = fetch_more_images(pname, city, allow_google=allow_google, needed=MAX_PLACE_GALLERY)
-                            if len(place_imgs) < MAX_PLACE_GALLERY:
-                                lead = fetch_wikipedia_lead(pname, city)
-                                if lead and lead not in place_imgs:
-                                    place_imgs.insert(0, lead)
-                            place_imgs = place_imgs[:MAX_PLACE_GALLERY]
+    # --- LOGIN ---
+    if "logged_in" not in st.session_state: st.session_state["logged_in"] = False
+    
+    if not st.session_state["logged_in"]:
+        st.markdown("<div class='login-box'><h2>🔒 Login</h2>", unsafe_allow_html=True)
+        with st.form("login"):
+            u = st.text_input("Username")
+            p = st.text_input("Password", type="password")
+            if st.form_submit_button("Login"):
+                if check_login(u, p):
+                    # LOG LOGIN EVENT
+                    with sqlite3.connect(DB_NAME) as conn:
+                        conn.execute("INSERT INTO login_history (username) VALUES (?)", (u,))
+                    st.session_state["logged_in"] = True
+                    st.session_state["username"] = u
+                    st.success("Success!")
+                    time.sleep(0.5)
+                    st.rerun()
+                else: st.error("Invalid (Try admin/travel123)")
+        st.markdown("</div>", unsafe_allow_html=True)
+        return
 
-                            if place_imgs:
-                                st.markdown("### 📸 Place Photos")
-                                cols_imgs = st.columns(MAX_PLACE_GALLERY)
-                                for idx_img, img_url in enumerate(place_imgs):
-                                    if idx_img < len(cols_imgs):
-                                        with cols_imgs[idx_img]:
-                                            st.image(img_url, use_container_width=True)
-                            else:
-                                st.caption("No verified images found.")
+    if "search_results" not in st.session_state: st.session_state["search_results"] = []
+    if "current_city" not in st.session_state: st.session_state["current_city"] = "Chennai"
+    if "messages" not in st.session_state: st.session_state["messages"] = [{"role": "assistant", "content": "Hi! Ask me travel tips."}]
 
-                            # Map & Weather
-                            plat = None; plon = None
-                            try:
-                                plat = meta.get("lat") or meta.get("latitude")
-                                plon = meta.get("lon") or meta.get("longitude")
-                            except: pass
-                            
-                            if plat and plon:
-                                map_url = f"https://www.google.com/maps/dir/?api=1&destination={plat},{plon}"
-                                st.markdown(f"[🗺️ Open place in Google Maps]({map_url})")
-                                
-                                place_weather = fetch_weather(float(plat), float(plon))
-                                if place_weather:
-                                    st.markdown("### 🌤️ Weather at this place")
-                                    cw = place_weather.get("current_weather", {})
-                                    st.write(f"**Current:** {cw.get('temperature')}°C  |  wind {cw.get('windspeed')} km/h")
+    with st.sidebar:
+        st.title(f"👤 {st.session_state['username']}")
+        if st.button("Logout"):
+            st.session_state["logged_in"] = False
+            st.rerun()
+        
+        st.divider()
+        st.subheader("💱 Currency Converter")
+        amt = st.number_input("Amount", 1.0, step=10.0)
+        c1, c2 = st.columns(2)
+        f_curr = c1.selectbox("From", ["USD", "EUR", "GBP", "INR", "JPY"], index=0)
+        t_curr = c2.selectbox("To", ["USD", "EUR", "GBP", "INR", "JPY"], index=3)
+        if st.button("Convert"):
+            val = convert_currency(amt, f_curr, t_curr)
+            st.success(f"{amt} {f_curr} = {val:.2f} {t_curr}")
 
-                            # Itinerary
-                            st.markdown("### 🗓️ Itinerary generator")
-                            days_local = st.number_input(f"Days to plan for {pname}", min_value=1, max_value=7, value=1, key=f"days_{i}")
-                            if st.button(f"Generate itinerary for {pname}", key=f"itin_{i}"):
-                                top_places = [clean_string(x["name"]) for x in scored[:12]] if 'scored' in locals() and scored else [pname]
-                                itin = generate_itinerary(pname if len(top_places)==1 else city, top_places, days=int(days_local))
-                                st.text(itin)
-
-                            # Compare
-                            st.markdown("### 🔁 Multi-city comparison")
-                            compare_input = st.text_input(f"Cities to compare for {pname}", value=f"{city}, Mumbai, Delhi", key=f"cmp_{i}")
-                            if st.button(f"Compare cities", key=f"cmp_btn_{i}"):
-                                clist = [c.strip() for c in compare_input.split(",")][:4]
-                                comp = compare_cities(clist, category=category)
-                                st.table(pd.DataFrame(comp))
-                            
-                            st.markdown("---")
-                            
-                            # Nearby Hotels
-                            st.markdown("### 🏨 Nearby Hotels")
-                            hotels_hits = geo_places(city_lat, city_lon, "accommodation.hotel,accommodation", limit=20)
-                            if not hotels_hits:
-                                st.write("No nearby hotels found.")
-                            else:
-                                for hh in hotels_hits[:5]:
-                                    hp = hh.get("properties", {})
-                                    st.markdown(f"**{hp.get('name', 'Unnamed Hotel')}** - ⭐ {hp.get('rating', 'NR')}")
-
-                        with right:
-                            allow_google = bool(st.session_state.get("allow_google_images", False))
-                            quick_gallery = fetch_more_images(clean_string(place["name"]), city, allow_google=allow_google, needed=MAX_PLACE_GALLERY)
-                            if quick_gallery:
-                                st.markdown("**Gallery (small)**")
-                                for u in quick_gallery[:MAX_PLACE_GALLERY]:
-                                    st.image(u, use_container_width=True)
-                        st.markdown("---")
-
-        st.markdown("---")
-        if show_until < total:
-            if st.button(f"Show more (next {PAGE_STEP})"):
-                st.session_state["offsets"][key] = show_until
+        st.divider()
+        st.title("🤖 AI Chat")
+        for msg in st.session_state["messages"]: st.chat_message(msg["role"]).write(msg["content"])
+        if prompt := st.chat_input("Ask something..."):
+            st.session_state["messages"].append({"role": "user", "content": prompt})
+            st.chat_message("user").write(prompt)
+            with st.spinner("..."):
+                st.session_state["messages"].append({"role": "assistant", "content": ollama_chat(prompt)})
                 st.rerun()
+        st.divider()
+        st.subheader("🗄️ History")
+        conn = sqlite3.connect(DB_NAME)
+        try: st.dataframe(pd.read_sql("SELECT city, category, search_date FROM search_history ORDER BY id DESC LIMIT 5", conn), hide_index=True)
+        except: pass
+        conn.close()
+
+    c1, c2 = st.columns([5, 1])
+    c1.title("🏙️ City Explorer Pro")
+    if c2.button("📅 Holiday Planner"): open_planner_popup()
+
+    st.markdown("---")
+    search_mode = st.radio("Search Mode:", ["Search by City", "Search by Specific Place"], horizontal=True)
+    sc1, sc2, sc3 = st.columns([3, 2, 1])
+    
+    if search_mode == "Search by City":
+        city_in = sc1.text_input("Enter City Name", value=st.session_state.get("current_city", "Chennai"))
+        cat_in = sc2.selectbox("Category", ["Tourist Places", "Temples", "Parks", "Top Recommendations"])
+    else:
+        city_in = sc1.text_input("Enter Place Name", "Kapaleeshwarar Temple")
+        cat_in = "Specific"
+
+    if sc3.button("Search 🔎") or st.session_state.get("trigger_search", False):
+        st.session_state["trigger_search"] = False
+        log_search(city_in, cat_in)
+        
+        if search_mode == "Search by City":
+            st.session_state["current_city"] = city_in
+            st.session_state["display_count"] = 10
+            api_cat = "tourism"
+            if cat_in == "Temples": api_cat = "religion.place_of_worship"
+            elif cat_in == "Parks": api_cat = "leisure.park,natural"
+            elif cat_in == "Top Recommendations": api_cat = "tourism.attraction,historic,natural"
+            
+            geo = geocode(city_in)
+            if geo:
+                with st.spinner("Searching..."):
+                    raw = get_places_api(geo['lat'], geo['lon'], api_cat, limit=100)
+                    clean = []
+                    seen = set()
+                    for item in raw:
+                        n = item['properties'].get('name')
+                        if n and n not in seen:
+                            if cat_in == "Tourist Places" and "temple" in n.lower(): continue
+                            clean.append({"name": n, "address": item['properties'].get('formatted'), "lat": item['properties']['lat'], "lon": item['properties']['lon'], "place_id": item['properties'].get('place_id'), "category": cat_in})
+                            seen.add(n)
+                    st.session_state["search_results"] = clean
+            else: st.error("City not found")
+        else:
+            with st.spinner("Locating..."):
+                geo = geocode(city_in)
+                if geo:
+                    st.session_state["current_city"] = geo.get('city', city_in)
+                    st.session_state["search_results"] = [{"name": geo.get('name', city_in), "address": geo.get('formatted'), "lat": geo['lat'], "lon": geo['lon'], "place_id": geo.get('place_id'), "category": "Specific"}]
+                else: st.error("Place not found")
+
+    results = st.session_state.get("search_results", [])
+    count = st.session_state.get("display_count", 10)
+    
+    if results:
+        st.write("### Results")
+        for i, place in enumerate(results[:count]):
+            with st.container():
+                c_a, c_b = st.columns([5, 1])
+                c_a.subheader(f"{i+1}. {place['name']}")
+                c_a.caption(place['address'])
+                if c_b.button("Details ➡️", key=f"btn_{i}"):
+                    show_place_details_popup(place, st.session_state["current_city"])
+                st.divider()
+        if count < len(results):
+            if st.button("Load More 🔄"):
+                st.session_state["display_count"] += 10
+                st.rerun()
+
+if __name__ == "__main__":
+    main()

@@ -18,15 +18,22 @@ GEO_SEARCH_KEY = "0ace8c8462a943b982df4fd2750d3407"
 GEO_DETAILS_KEY = "e93a6200c4bb4963b2516daea5537422" 
 OLLAMA_URL = "http://localhost:11434/api/chat"
 
-DB_NAME = "travel_master_v16.db"
+DB_NAME = "travel_master_v17.db"
 CHROMA_PATH = "./chroma_db_travel"
 
 # --- DATABASE ENGINE ---
 def init_db():
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
+    
+    c.execute('''CREATE TABLE IF NOT EXISTS users (
+            username TEXT PRIMARY KEY, 
+            password TEXT, 
+            email TEXT, 
+            phone TEXT
+    )''')
+
     tables = [
-        "users (username TEXT PRIMARY KEY, password TEXT)",
         "search_history (id INTEGER PRIMARY KEY AUTOINCREMENT, city TEXT, category TEXT, search_date DATETIME DEFAULT CURRENT_TIMESTAMP)",
         "itinerary_history (id INTEGER PRIMARY KEY AUTOINCREMENT, city TEXT, place TEXT, days INTEGER, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)",
         "comparison_history (id INTEGER PRIMARY KEY AUTOINCREMENT, city_1 TEXT, city_2 TEXT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)",
@@ -36,7 +43,7 @@ def init_db():
     for t in tables:
         c.execute(f"CREATE TABLE IF NOT EXISTS {t}")
     
-    c.execute("INSERT OR IGNORE INTO users (username, password) VALUES ('admin', 'travel123')")
+    c.execute("INSERT OR IGNORE INTO users (username, password, email, phone) VALUES ('admin', 'travel123', 'admin@travel.com', '9999999999')")
     conn.commit()
     conn.close()
 
@@ -45,15 +52,27 @@ def init_chroma(): return None
 def store_in_chroma(collection, place_name, city, description, category): pass
 def query_chroma(collection, query_text): return ""
 
-# --- AUTH ---
+# --- AUTH FUNCTIONS ---
 def check_login(username, password):
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
     c.execute("SELECT password FROM users WHERE username = ?", (username,))
     data = c.fetchone()
     conn.close()
-    if data and data[0] == password: return True
+    if data and data[0] == password:
+        return True
     return False
+
+def create_account(username, password, email, phone):
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        c = conn.cursor()
+        c.execute("INSERT INTO users (username, password, email, phone) VALUES (?, ?, ?, ?)", (username, password, email, phone))
+        conn.commit()
+        conn.close()
+        return True
+    except sqlite3.IntegrityError:
+        return False 
 
 # --- LOGGING ---
 def log_login(username):
@@ -209,7 +228,7 @@ def google_scrape_images(query, limit=1):
     except: pass
     return out
 
-# --- NEW HELPERS (BUDGET, PACKING, AI, PDF, MAP, CURRENCY) ---
+# --- NEW HELPERS ---
 
 def calculate_budget(days, people, style):
     if style == "Backpacker 🎒":
@@ -504,6 +523,13 @@ def show_place_details_popup(p, city):
     with st.expander("🎒 Smart Packing Checklist"):
         for item in packing_items: st.markdown(f"- {item}")
 
+    with st.expander("🗣️ Local Lingo (Phrasebook)"):
+        c1, c2 = st.columns(2)
+        items = list(lingo.items())
+        half = len(items) // 2
+        for k, v in items[:half]: c1.write(f"**{k}:** {v}")
+        for k, v in items[half:]: c2.write(f"**{k}:** {v}")
+
     with st.expander("💰 Trip Budget Estimator"):
         b1, b2 = st.columns(2)
         tr = b1.number_input("Travelers", 1, 10, 2, key=f"tr_{p['name']}")
@@ -512,13 +538,6 @@ def show_place_details_popup(p, city):
         if st.button("Calculate", key=f"calc_{p['name']}"):
             cst, dsc = calculate_budget(dy, tr, sty)
             st.success(f"Est: ₹{cst:,} ({dsc})")
-
-    with st.expander("🗣️ Local Lingo (Phrasebook)"):
-        c1, c2 = st.columns(2)
-        items = list(lingo.items())
-        half = len(items) // 2
-        for k, v in items[:half]: c1.write(f"**{k}:** {v}")
-        for k, v in items[half:]: c2.write(f"**{k}:** {v}")
 
     with st.expander("🗺️ Itinerary Planner (Map + PDF)"):
         idays = st.number_input("Plan for (Days)", 1, 7, 3, key=f"idays_{p['name']}")
@@ -546,14 +565,28 @@ def show_place_details_popup(p, city):
             st.download_button("Download PDF 📥", pdf_bytes, f"Itinerary_{city}.pdf", key=f"dl_{p['name']}")
 
     with st.expander("⚖️ Multi-City Comparison"):
-        c_in = st.text_input("Compare with (e.g. Mumbai):", key=f"cmp_{p['name']}")
+        c_in = st.text_input("Compare with (comma separated, e.g. Mumbai, Delhi):", key=f"cmp_{p['name']}")
         if st.button("Compare", key=f"btn_cmp_{p['name']}"):
-            g = geocode(c_in)
-            if g:
-                wt = fetch_weather(g['lat'], g['lon'])
-                d = [{"City": city, "Temp": f"{w.get('temperature')}°C"}, {"City": c_in, "Temp": f"{wt.get('temperature')}°C"}]
-                st.table(pd.DataFrame(d))
-            else: st.error("City not found")
+            # Base data (Current City)
+            comp_data = [{"City": city, "Temp": f"{w.get('temperature')}°C", "Sky": get_weather_desc(w.get('weathercode', 0))}]
+            
+            # Process Inputs
+            targets = [x.strip() for x in c_in.split(',') if x.strip()]
+            
+            for t_city in targets:
+                g = geocode(t_city)
+                if g:
+                    wt = fetch_weather(g['lat'], g['lon'])
+                    comp_data.append({
+                        "City": t_city, 
+                        "Temp": f"{wt.get('temperature')}°C",
+                        "Sky": get_weather_desc(wt.get('weathercode', 0))
+                    })
+            
+            if len(comp_data) > 1:
+                st.table(pd.DataFrame(comp_data))
+            else:
+                st.warning("No valid cities found to compare.")
 
     with st.expander("🏨 Nearby Facilities"):
         nb_type = st.selectbox("Type", ["Hotels", "Restaurants", "Hospitals"], key=f"nb_{p['name']}")
@@ -622,6 +655,7 @@ def main():
 
     # --- LOGIN ---
     if "logged_in" not in st.session_state: st.session_state["logged_in"] = False
+    if "show_signup" not in st.session_state: st.session_state["show_signup"] = False
     
     if not st.session_state["logged_in"]:
         st.markdown("<div class='login-box'><h2>🔒 Login</h2>", unsafe_allow_html=True)
@@ -630,15 +664,29 @@ def main():
             p = st.text_input("Password", type="password")
             if st.form_submit_button("Login"):
                 if check_login(u, p):
-                    # LOG LOGIN EVENT
-                    with sqlite3.connect(DB_NAME) as conn:
-                        conn.execute("INSERT INTO login_history (username) VALUES (?)", (u,))
+                    log_login(u) # Fix: call correct log function
                     st.session_state["logged_in"] = True
                     st.session_state["username"] = u
                     st.success("Success!")
                     time.sleep(0.5)
                     st.rerun()
                 else: st.error("Invalid (Try admin/travel123)")
+            
+            st.markdown("---")
+            st.markdown("Don't have an account?")
+        
+        with st.expander("📝 Create Account"):
+            with st.form("signup"):
+                new_u = st.text_input("New Username")
+                new_p = st.text_input("New Password", type="password")
+                new_e = st.text_input("Email")
+                new_ph = st.text_input("Phone")
+                if st.form_submit_button("Sign Up"):
+                    if create_account(new_u, new_p, new_e, new_ph):
+                        st.success("Created! Please login.")
+                    else:
+                        st.error("Username exists.")
+
         st.markdown("</div>", unsafe_allow_html=True)
         return
 
